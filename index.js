@@ -1,6 +1,11 @@
-// =============================================================================
-// NFC-e Relay SP — Render
-// =============================================================================
+// SEFAZ-SP NFC-e Relay
+// ---------------------------------------------------------------
+// Fluxo correto (cStat 225 fix):
+//   1. Assina <infNFe> dentro de <NFe>
+//   2. Envelopa <NFe> assinada (SEM <infNFeSupl>) em <enviNFe> e transmite
+//   3. Após transmitir, adiciona <infNFeSupl> com QR Code no XML retornado
+//      à aplicação (para salvar no banco e imprimir DANFE)
+// ---------------------------------------------------------------
 
 const express = require("express");
 const https = require("https");
@@ -10,16 +15,10 @@ const forge = require("node-forge");
 const { DOMParser, XMLSerializer } = require("@xmldom/xmldom");
 const { SignedXml } = require("xml-crypto");
 
-const app = express();
-app.use(express.json({ limit: "20mb" }));
-
-// =============================================================================
-// CA BUNDLE — ICP-Brasil
-// SUBSTITUA o conteudo abaixo pelos PEMs reais das raizes ICP-Brasil v2/v5/v10
-// Baixe em: https://www.gov.br/iti/pt-br/assuntos/repositorio/repositorio-ac-raiz
-// =============================================================================
-const ICP_BRASIL_CA = `
------BEGIN CERTIFICATE-----
+// ============================================================
+// 1. ICP-Brasil CA Bundle (substitua pelos PEMs reais)
+// ============================================================
+const AC_RAIZ_V2 = `-----BEGIN CERTIFICATE-----
 MIIGoTCCBImgAwIBAgIBATANBgkqhkiG9w0BAQ0FADCBlzELMAkGA1UEBhMCQlIx
 EzARBgNVBAoTCklDUC1CcmFzaWwxPTA7BgNVBAsTNEluc3RpdHV0byBOYWNpb25h
 bCBkZSBUZWNub2xvZ2lhIGRhIEluZm9ybWFjYW8gLSBJVEkxNDAyBgNVBAMTK0F1
@@ -57,45 +56,9 @@ gDQ/qZXow63EzZ7KFBYsGZ7kNou5uaNCJQc+w+XVaE+gZhyms7ZzHJAaP0C5GlZC
 cIf/by0PEf0e//eFMBUO4xcx7ieVzMnpmR6Xx21bB7UFaj3yRd+6gnkkcC6bgh9m
 qaVtJ8z2KqLRX4Vv4EadqtKlTlUO
 -----END CERTIFICATE-----
------BEGIN CERTIFICATE-----
-MIIGrDCCBJSgAwIBAgIJANLVi0S/gZNCMA0GCSqGSIb3DQEBDQUAMIGYMQswCQYD
-VQQGEwJCUjETMBEGA1UECgwKSUNQLUJyYXNpbDE9MDsGA1UECww0SW5zdGl0dXRv
-IE5hY2lvbmFsIGRlIFRlY25vbG9naWEgZGEgSW5mb3JtYWNhbyAtIElUSTE1MDMG
-A1UEAwwsQXV0b3JpZGFkZSBDZXJ0aWZpY2Fkb3JhIFJhaXogQnJhc2lsZWlyYSB2
-MTAwHhcNMTkwNzAxMTkxNTU5WhcNMzIwNzAxMTIwMDU5WjCBmDELMAkGA1UEBhMC
-QlIxEzARBgNVBAoMCklDUC1CcmFzaWwxPTA7BgNVBAsMNEluc3RpdHV0byBOYWNp
-b25hbCBkZSBUZWNub2xvZ2lhIGRhIEluZm9ybWFjYW8gLSBJVEkxNTAzBgNVBAMM
-LEF1dG9yaWRhZGUgQ2VydGlmaWNhZG9yYSBSYWl6IEJyYXNpbGVpcmEgdjEwMIIC
-IjANBgkqhkiG9w0BAQEFAAOCAg8AMIICCgKCAgEAk3AxKl1ZtP0pNyjChqO7qNkn
-+/sClZeqiV/Kd7KnnbkDbI2y3VWcUG7feCE/deIxot6GH6JXncRG794UZl+4doD0
-D0/cEwBd4DvrDSZm0RT40xhmYYOTxZDJxv+coTHdmsT5aNmSkktfjzYX4HQHh/7M
-em+kTOpT/3E4K6B7KVs9HkOT7nXx5yU1qYbVWqI0qpJM9mOTSFx8C9HiKcHvLCvt
-1ioXKPAmFuHPkayOcXP2MXeb+VRNjWKU4E+L2t5uZPKVx1M/9i1DztlLb4K8OfYg
-GaPDUSF1sxnoGk5qZHLleO6KjCpmuQepmgsBvxi2YNO7X2YUwQQx1AXNSolgtkAR
-5gt+1WzxhbFUhItQqlhqxgWHefLmiT5T/Ctz/P2v+zSO4efkkIzsi1iwD+ypZvM2
-lnIvB24RcSN6jzmCahLPX4CwjwIK6JsSoMVxIhpZHCguUP4LXqP8IWUZ6WgS/4zB
-7B9E0EICl2rM1PRy+6ulv+ZOW256e8a0pijUB+hXM1msUq9L92476FAAX8va3sP7
-+Uut94+bGHmubcTLImWUPrxNT7QyrvE3FyHicfiHioeFL2oV4cXTLZrEq2wS8R4P
-KPdSzNn5Z9e2uMEGYQaSNO+OwvVycpIhOBOqrm12wJ9ZhWKtM5UOo34/o37r5ZBI
-TYXAGbhqQDB9mWXwH+0CAwEAAaOB9jCB8zBOBgNVHSAERzBFMEMGBWBMAQEAMDow
-OAYIKwYBBQUHAgEWLGh0dHA6Ly9hY3JhaXouaWNwYnJhc2lsLmdvdi5ici9EUENh
-Y3JhaXoucGRmMEAGA1UdHwQ5MDcwNaAzoDGGL2h0dHA6Ly9hY3JhaXouaWNwYnJh
-c2lsLmdvdi5ici9MQ1JhY3JhaXp2MTAuY3JsMB8GA1UdIwQYMBaAFHTzfv/8n1N6
-8Xzrqz6kptoYukVjMB0GA1UdDgQWBBR0837//J9TevF866s+pKbaGLpFYzAPBgNV
-HRMBAf8EBTADAQH/MA4GA1UdDwEB/wQEAwIBBjANBgkqhkiG9w0BAQ0FAAOCAgEA
-eCNhBSuy/Ih/T+1VOtAJju85SrtoE3vET1qXASpmjQllDHG/ph7VFNRAkC+gha+B
-CbjoA5oJ/8wwl+Qdp1KGz6nXXFTLx3osU+kjm0srmBf9nyXHPqvFyvBeB0A7sYb7
-TmII9GKD20oCxsdkccR/oE/JuTaNnGq0GYZ2aDb5v62uLi21Y6P9UBiTxZqQ4ojW
-ET6kXNjlK238jpXv17FR8Sg3VusCvX7Q8eJkavvHHZDeWck2fSA+ycAc2JeL2Z0B
-MSxGWpH32WM9J8+6XqCJUXHiWEV0zCE8wDYiYC+047pTxQI/gB/FcU7jvylh98DJ
-kQPHd/Tp6Og3ynlDA9n9uBbxYHVRZs9vsZ/7xTFaxRe+zk8dhgKgZ/3RrcMFB570
-2t8LFbyuUE/kQVY6rZ0QJ9qMWQ7VPLRwRhiMeU3k8WDJb/tBbOXHBqldTbWyQ+mp
-MEDWhbrzE/IED82wAuO23Tb05cYk2xC7+Izef8fSc3XdJDuPSbcDpWukzyCDtSEH
-isLiGEtIbYRiPsF3czlQPsnIEVoTTCWxHCH1zYR6zScSv18Qh69qVe2J40K5jZoP
-GEOhq/oKhVJQAdvAFW5Odp7mF3Tk9nivjjsctJSxY26LFiV5GRV+07SSse4ti0aO
-jO5PLg5SWjfcOtBG2rz02EIvQAmLcb0kGBtfdj0lW/w=
------END CERTIFICATE-----
------BEGIN CERTIFICATE-----
+`;
+
+const AC_RAIZ_V5 = `-----BEGIN CERTIFICATE-----
 MIIGoTCCBImgAwIBAgIBATANBgkqhkiG9w0BAQ0FADCBlzELMAkGA1UEBhMCQlIx
 EzARBgNVBAoMCklDUC1CcmFzaWwxPTA7BgNVBAsMNEluc3RpdHV0byBOYWNpb25h
 bCBkZSBUZWNub2xvZ2lhIGRhIEluZm9ybWFjYW8gLSBJVEkxNDAyBgNVBAMMK0F1
@@ -133,90 +96,102 @@ iyGEsgKULkCH4o2Vgl1gQuKWO4V68rFW8a/jvq28sbY+y/Ao0I5ohpnBcQOAawiF
 bz6yJtObajYMuztDDP8oY656EuuJXBJhuKAJPI/7WDtgfV8ffOh/iQGQATVMtgDN
 0gv8bn5NdUX8UMNX1sHhU3H1UpoW
 -----END CERTIFICATE-----
-`.trim();
+`;
 
-const CA_BUNDLE = [ICP_BRASIL_CA, ...tls.rootCertificates];
+const AC_RAIZ_V10 = `-----BEGIN CERTIFICATE-----
+MIIGrDCCBJSgAwIBAgIJANLVi0S/gZNCMA0GCSqGSIb3DQEBDQUAMIGYMQswCQYD
+VQQGEwJCUjETMBEGA1UECgwKSUNQLUJyYXNpbDE9MDsGA1UECww0SW5zdGl0dXRv
+IE5hY2lvbmFsIGRlIFRlY25vbG9naWEgZGEgSW5mb3JtYWNhbyAtIElUSTE1MDMG
+A1UEAwwsQXV0b3JpZGFkZSBDZXJ0aWZpY2Fkb3JhIFJhaXogQnJhc2lsZWlyYSB2
+MTAwHhcNMTkwNzAxMTkxNTU5WhcNMzIwNzAxMTIwMDU5WjCBmDELMAkGA1UEBhMC
+QlIxEzARBgNVBAoMCklDUC1CcmFzaWwxPTA7BgNVBAsMNEluc3RpdHV0byBOYWNp
+b25hbCBkZSBUZWNub2xvZ2lhIGRhIEluZm9ybWFjYW8gLSBJVEkxNTAzBgNVBAMM
+LEF1dG9yaWRhZGUgQ2VydGlmaWNhZG9yYSBSYWl6IEJyYXNpbGVpcmEgdjEwMIIC
+IjANBgkqhkiG9w0BAQEFAAOCAg8AMIICCgKCAgEAk3AxKl1ZtP0pNyjChqO7qNkn
++/sClZeqiV/Kd7KnnbkDbI2y3VWcUG7feCE/deIxot6GH6JXncRG794UZl+4doD0
+D0/cEwBd4DvrDSZm0RT40xhmYYOTxZDJxv+coTHdmsT5aNmSkktfjzYX4HQHh/7M
+em+kTOpT/3E4K6B7KVs9HkOT7nXx5yU1qYbVWqI0qpJM9mOTSFx8C9HiKcHvLCvt
+1ioXKPAmFuHPkayOcXP2MXeb+VRNjWKU4E+L2t5uZPKVx1M/9i1DztlLb4K8OfYg
+GaPDUSF1sxnoGk5qZHLleO6KjCpmuQepmgsBvxi2YNO7X2YUwQQx1AXNSolgtkAR
+5gt+1WzxhbFUhItQqlhqxgWHefLmiT5T/Ctz/P2v+zSO4efkkIzsi1iwD+ypZvM2
+lnIvB24RcSN6jzmCahLPX4CwjwIK6JsSoMVxIhpZHCguUP4LXqP8IWUZ6WgS/4zB
+7B9E0EICl2rM1PRy+6ulv+ZOW256e8a0pijUB+hXM1msUq9L92476FAAX8va3sP7
++Uut94+bGHmubcTLImWUPrxNT7QyrvE3FyHicfiHioeFL2oV4cXTLZrEq2wS8R4P
+KPdSzNn5Z9e2uMEGYQaSNO+OwvVycpIhOBOqrm12wJ9ZhWKtM5UOo34/o37r5ZBI
+TYXAGbhqQDB9mWXwH+0CAwEAAaOB9jCB8zBOBgNVHSAERzBFMEMGBWBMAQEAMDow
+OAYIKwYBBQUHAgEWLGh0dHA6Ly9hY3JhaXouaWNwYnJhc2lsLmdvdi5ici9EUENh
+Y3JhaXoucGRmMEAGA1UdHwQ5MDcwNaAzoDGGL2h0dHA6Ly9hY3JhaXouaWNwYnJh
+c2lsLmdvdi5ici9MQ1JhY3JhaXp2MTAuY3JsMB8GA1UdIwQYMBaAFHTzfv/8n1N6
+8Xzrqz6kptoYukVjMB0GA1UdDgQWBBR0837//J9TevF866s+pKbaGLpFYzAPBgNV
+HRMBAf8EBTADAQH/MA4GA1UdDwEB/wQEAwIBBjANBgkqhkiG9w0BAQ0FAAOCAgEA
+eCNhBSuy/Ih/T+1VOtAJju85SrtoE3vET1qXASpmjQllDHG/ph7VFNRAkC+gha+B
+CbjoA5oJ/8wwl+Qdp1KGz6nXXFTLx3osU+kjm0srmBf9nyXHPqvFyvBeB0A7sYb7
+TmII9GKD20oCxsdkccR/oE/JuTaNnGq0GYZ2aDb5v62uLi21Y6P9UBiTxZqQ4ojW
+ET6kXNjlK238jpXv17FR8Sg3VusCvX7Q8eJkavvHHZDeWck2fSA+ycAc2JeL2Z0B
+MSxGWpH32WM9J8+6XqCJUXHiWEV0zCE8wDYiYC+047pTxQI/gB/FcU7jvylh98DJ
+kQPHd/Tp6Og3ynlDA9n9uBbxYHVRZs9vsZ/7xTFaxRe+zk8dhgKgZ/3RrcMFB570
+2t8LFbyuUE/kQVY6rZ0QJ9qMWQ7VPLRwRhiMeU3k8WDJb/tBbOXHBqldTbWyQ+mp
+MEDWhbrzE/IED82wAuO23Tb05cYk2xC7+Izef8fSc3XdJDuPSbcDpWukzyCDtSEH
+isLiGEtIbYRiPsF3czlQPsnIEVoTTCWxHCH1zYR6zScSv18Qh69qVe2J40K5jZoP
+GEOhq/oKhVJQAdvAFW5Odp7mF3Tk9nivjjsctJSxY26LFiV5GRV+07SSse4ti0aO
+jO5PLg5SWjfcOtBG2rz02EIvQAmLcb0kGBtfdj0lW/w=
+-----END CERTIFICATE-----
+`;
 
-// =============================================================================
-// URLs SEFAZ-SP
-// =============================================================================
+const ICP_BRASIL_CA_BUNDLE = [AC_RAIZ_V2, AC_RAIZ_V5, AC_RAIZ_V10];
+const FULL_CA_BUNDLE = [...ICP_BRASIL_CA_BUNDLE, ...tls.rootCertificates];
+
+// ============================================================
+// 2. URLs SEFAZ-SP
+// ============================================================
 const SEFAZ_URLS = {
-  autorizacao: {
-    1: "https://nfce.fazenda.sp.gov.br/ws/NFeAutorizacao4.asmx",
-    2: "https://homologacao.nfce.fazenda.sp.gov.br/ws/NFeAutorizacao4.asmx",
-  },
-  qrcode: {
-    1: "https://www.nfce.fazenda.sp.gov.br/qrcode",
-    2: "https://www.homologacao.nfce.fazenda.sp.gov.br/qrcode",
-  },
-  consultaChave: {
-    1: "https://www.nfce.fazenda.sp.gov.br/consulta",
-    2: "https://www.homologacao.nfce.fazenda.sp.gov.br/consulta",
-  },
+  homologacao: "https://homologacao.nfce.fazenda.sp.gov.br/ws/NFeAutorizacao4.asmx",
+  producao: "https://nfce.fazenda.sp.gov.br/ws/NFeAutorizacao4.asmx",
+};
+const QR_BASE = {
+  homologacao: "https://www.homologacao.nfce.fazenda.sp.gov.br/qrcode",
+  producao: "https://www.nfce.fazenda.sp.gov.br/qrcode",
 };
 
-// =============================================================================
-// Auth Bearer token
-// =============================================================================
-const RELAY_TOKEN = process.env.RELAY_TOKEN || process.env.SEFAZ_RELAY_TOKEN || "";
-
-function checkAuth(req, res) {
-  if (!RELAY_TOKEN) return true;
-  const auth = req.headers["authorization"] || "";
-  const expected = `Bearer ${RELAY_TOKEN}`;
-  if (auth !== expected) {
-    res.status(401).json({ error: "Unauthorized" });
-    return false;
-  }
-  return true;
-}
-
-// =============================================================================
-// PFX -> PEM
-// =============================================================================
+// ============================================================
+// 3. PFX → PEM
+// ============================================================
 function pfxToPem(pfxBase64, senha) {
-  const pfxDer = forge.util.decode64(pfxBase64);
-  const pfxAsn1 = forge.asn1.fromDer(pfxDer);
-  const p12 = forge.pkcs12.pkcs12FromAsn1(pfxAsn1, false, senha);
+  const der = forge.util.decode64(pfxBase64);
+  const asn1 = forge.asn1.fromDer(der);
+  const p12 = forge.pkcs12.pkcs12FromAsn1(asn1, senha);
 
   let keyPem = null;
   let certPem = null;
-  const caCerts = [];
 
-  for (const safe of p12.safeContents) {
-    for (const bag of safe.safeBags) {
-      if (bag.type === forge.pki.oids.pkcs8ShroudedKeyBag || bag.type === forge.pki.oids.keyBag) {
-        keyPem = forge.pki.privateKeyToPem(bag.key);
-      } else if (bag.type === forge.pki.oids.certBag) {
-        const pem = forge.pki.certificateToPem(bag.cert);
-        if (!certPem) certPem = pem;
-        else caCerts.push(pem);
+  for (const safeContents of p12.safeContents) {
+    for (const safeBag of safeContents.safeBags) {
+      if (safeBag.type === forge.pki.oids.pkcs8ShroudedKeyBag || safeBag.type === forge.pki.oids.keyBag) {
+        keyPem = forge.pki.privateKeyToPem(safeBag.key);
+      } else if (safeBag.type === forge.pki.oids.certBag) {
+        if (!certPem) certPem = forge.pki.certificateToPem(safeBag.cert);
       }
     }
   }
-
-  if (!keyPem || !certPem) {
-    throw new Error("PFX nao contem chave privada ou certificado.");
-  }
-
-  return { keyPem, certPem, caCerts };
+  if (!keyPem || !certPem) throw new Error("PFX inválido: chave ou certificado ausente");
+  return { keyPem, certPem };
 }
 
-// =============================================================================
-// Assinar <infNFe>
-// =============================================================================
+// ============================================================
+// 4. Assinatura XML (xml-crypto v6+)
+// ============================================================
 function signNFe(xmlNFe, keyPem, certPem) {
-  const certB64 = certPem
+  const certBody = certPem
     .replace(/-----BEGIN CERTIFICATE-----/g, "")
     .replace(/-----END CERTIFICATE-----/g, "")
     .replace(/\s+/g, "");
 
   const sig = new SignedXml({
     privateKey: keyPem,
+    publicCert: certPem,
     signatureAlgorithm: "http://www.w3.org/2000/09/xmldsig#rsa-sha1",
-    canonicalizationAlgorithm: "http://www.w3.org/TR/2001/REC-xml-c14n-20010315",
-    getKeyInfoContent: () =>
-      `<X509Data><X509Certificate>${certB64}</X509Certificate></X509Data>`,
+    canonicalizationAlgorithm: "http://www.w3.org/2001/10/xml-exc-c14n#",
+    getKeyInfoContent: () => `<X509Data><X509Certificate>${certBody}</X509Certificate></X509Data>`,
   });
 
   sig.addReference({
@@ -224,9 +199,8 @@ function signNFe(xmlNFe, keyPem, certPem) {
     digestAlgorithm: "http://www.w3.org/2000/09/xmldsig#sha1",
     transforms: [
       "http://www.w3.org/2000/09/xmldsig#enveloped-signature",
-      "http://www.w3.org/TR/2001/REC-xml-c14n-20010315",
+      "http://www.w3.org/2001/10/xml-exc-c14n#",
     ],
-    uri: `#${extractInfNFeId(xmlNFe)}`,
   });
 
   sig.computeSignature(xmlNFe, {
@@ -236,51 +210,39 @@ function signNFe(xmlNFe, keyPem, certPem) {
   return sig.getSignedXml();
 }
 
-function extractInfNFeId(xml) {
-  const m = xml.match(/<infNFe[^>]*\bId="([^"]+)"/);
-  if (!m) throw new Error("infNFe sem atributo Id.");
-  return m[1];
+// ============================================================
+// 5. QR Code NFC-e 4.00
+// ============================================================
+function buildQrCode(chave, tpAmb, cscId, cscToken, ambiente) {
+  const param = `${chave}|2|${tpAmb}|${cscId}`;
+  const hash = crypto.createHash("sha1").update(param + cscToken).digest("hex").toUpperCase();
+  const qrCode = `${QR_BASE[ambiente]}?p=${param}|${hash}`;
+  const urlChave = `${QR_BASE[ambiente]}`;
+  return { qrCode, urlChave };
 }
 
-// =============================================================================
-// QR Code NFC-e 4.00 (tpEmis=1)
-// paramUrl   = chNFe|nVersao|tpAmb               (SEM cIdToken)
-// stringHash = chNFe|nVersao|tpAmb|cIdToken|CSC  (cIdToken+CSC so no hash)
-// =============================================================================
-function buildQrCode({ chave, ambiente, csc_id, csc_token, qrBase }) {
-  const tpAmb = String(ambiente);
-  const nVersao = "2";
-  const cIdToken = String(csc_id).padStart(6, "0");
-  const paramUrl = `${chave}|${nVersao}|${tpAmb}`;
-  const stringHash = `${chave}|${nVersao}|${tpAmb}|${cIdToken}|${csc_token}`;
-  const hash = crypto.createHash("sha1").update(stringHash).digest("hex").toUpperCase();
-  return `${qrBase}?p=${paramUrl}|${hash}`;
-}
-
-// =============================================================================
-// inserir <infNFeSupl> DEPOIS de <Signature>
-// Ordem correta NFC-e 4.00: infNFe -> Signature -> infNFeSupl
-// =============================================================================
-function insertInfNFeSupl(xmlNFeAssinado, qrCodeUrl, urlChave) {
-  const doc = new DOMParser().parseFromString(xmlNFeAssinado, "text/xml");
+// ============================================================
+// 6. Adiciona <infNFeSupl> no XML JÁ ASSINADO (pós-transmissão)
+//    Posição correta: dentro de <NFe>, ANTES de <Signature>
+// ============================================================
+function addInfNFeSupl(xmlAssinado, qrCode, urlChave) {
+  const doc = new DOMParser().parseFromString(xmlAssinado, "text/xml");
   const nfe = doc.getElementsByTagName("NFe")[0];
-  if (!nfe) throw new Error("Tag <NFe> nao encontrada para inserir infNFeSupl.");
+  if (!nfe) throw new Error("Tag <NFe> não encontrada");
 
-  const supl = doc.createElement("infNFeSupl");
-  const qr = doc.createElement("qrCode");
-  qr.appendChild(doc.createCDATASection(qrCodeUrl));
-  const url = doc.createElement("urlChave");
+  const ns = "http://www.portalfiscal.inf.br/nfe";
+  const supl = doc.createElementNS(ns, "infNFeSupl");
+  const qr = doc.createElementNS(ns, "qrCode");
+  qr.appendChild(doc.createCDATASection(qrCode));
+  const url = doc.createElementNS(ns, "urlChave");
   url.appendChild(doc.createTextNode(urlChave));
   supl.appendChild(qr);
   supl.appendChild(url);
 
-  const signature = nfe.getElementsByTagName("Signature")[0];
-  if (signature) {
-    if (signature.nextSibling) {
-      nfe.insertBefore(supl, signature.nextSibling);
-    } else {
-      nfe.appendChild(supl);
-    }
+  // Inserir antes de <Signature>
+  const sig = nfe.getElementsByTagName("Signature")[0];
+  if (sig) {
+    nfe.insertBefore(supl, sig);
   } else {
     nfe.appendChild(supl);
   }
@@ -288,175 +250,152 @@ function insertInfNFeSupl(xmlNFeAssinado, qrCodeUrl, urlChave) {
   return new XMLSerializer().serializeToString(doc);
 }
 
-// =============================================================================
-// Envelopes enviNFe + SOAP 1.2
-// =============================================================================
-function buildEnviNFe(xmlNFeAssinadoComSupl, idLote) {
+// ============================================================
+// 7. Envelope <enviNFe> (SEM infNFeSupl — apenas NFe assinada)
+// ============================================================
+function buildEnviNFe(xmlNFeAssinada) {
   return `<?xml version="1.0" encoding="UTF-8"?>` +
     `<enviNFe xmlns="http://www.portalfiscal.inf.br/nfe" versao="4.00">` +
-    `<idLote>${idLote}</idLote>` +
+    `<idLote>1</idLote>` +
     `<indSinc>1</indSinc>` +
-    `${xmlNFeAssinadoComSupl.replace(/<\?xml[^>]*\?>/, "")}` +
+    xmlNFeAssinada.replace(/<\?xml[^>]*\?>/, "") +
     `</enviNFe>`;
 }
 
-function buildSoapEnvelope(enviNFeXml) {
+// ============================================================
+// 8. Envelope SOAP 1.2
+// ============================================================
+function buildSoapEnvelope(enviNFe) {
+  const inner = enviNFe.replace(/<\?xml[^>]*\?>/, "");
   return `<?xml version="1.0" encoding="UTF-8"?>` +
     `<soap12:Envelope xmlns:soap12="http://www.w3.org/2003/05/soap-envelope" xmlns:nfe="http://www.portalfiscal.inf.br/nfe/wsdl/NFeAutorizacao4">` +
     `<soap12:Body>` +
-    `<nfe:nfeDadosMsg>${enviNFeXml.replace(/<\?xml[^>]*\?>/, "")}</nfe:nfeDadosMsg>` +
+    `<nfe:nfeDadosMsg>${inner}</nfe:nfeDadosMsg>` +
     `</soap12:Body>` +
     `</soap12:Envelope>`;
 }
 
-// =============================================================================
-// POST mTLS para SEFAZ
-// =============================================================================
-function postSefaz({ url, body, pfxBase64, senha }) {
+// ============================================================
+// 9. Transmissão SEFAZ
+// ============================================================
+function postSefaz(url, soapXml, pfxBuffer, senha) {
   return new Promise((resolve, reject) => {
     const u = new URL(url);
     const agent = new https.Agent({
-      pfx: Buffer.from(pfxBase64, "base64"),
+      ca: FULL_CA_BUNDLE,
+      pfx: pfxBuffer,
       passphrase: senha,
-      ca: CA_BUNDLE,
       keepAlive: true,
-      rejectUnauthorized: true,
-      minVersion: "TLSv1.2",
     });
 
     const req = https.request(
       {
-        host: u.hostname,
-        port: u.port || 443,
-        path: u.pathname + u.search,
+        hostname: u.hostname,
+        port: 443,
+        path: u.pathname,
         method: "POST",
         agent,
         headers: {
-          "Content-Type": "application/soap+xml; charset=utf-8",
-          "Content-Length": Buffer.byteLength(body, "utf8"),
-          "SOAPAction":
-            "http://www.portalfiscal.inf.br/nfe/wsdl/NFeAutorizacao4/nfeAutorizacaoLote",
+          "Content-Type": 'application/soap+xml; charset=utf-8; action="http://www.portalfiscal.inf.br/nfe/wsdl/NFeAutorizacao4/nfeAutorizacaoLote"',
+          "Content-Length": Buffer.byteLength(soapXml),
         },
       },
       (res) => {
-        const chunks = [];
-        res.on("data", (c) => chunks.push(c));
-        res.on("end", () => {
-          resolve({
-            status: res.statusCode,
-            headers: res.headers,
-            body: Buffer.concat(chunks).toString("utf8"),
-          });
-        });
+        let data = "";
+        res.on("data", (c) => (data += c));
+        res.on("end", () => resolve({ status: res.statusCode, body: data }));
       }
     );
-
     req.on("error", reject);
-    req.write(body);
+    req.write(soapXml);
     req.end();
   });
 }
 
-// =============================================================================
-// Extrair cStat / nProt / xMotivo
-// =============================================================================
-function parseRetorno(xmlRetorno) {
-  const grab = (tag) => {
-    const m = xmlRetorno.match(new RegExp(`<${tag}[^>]*>([^<]+)</${tag}>`));
+// ============================================================
+// 10. Parse retorno
+// ============================================================
+function parseRetorno(soapBody) {
+  const get = (tag) => {
+    const m = soapBody.match(new RegExp(`<${tag}[^>]*>([^<]+)</${tag}>`));
     return m ? m[1] : null;
   };
   return {
-    cStat: grab("cStat"),
-    xMotivo: grab("xMotivo"),
-    nProt: grab("nProt"),
-    chNFe: grab("chNFe"),
+    cStat: get("cStat"),
+    xMotivo: get("xMotivo"),
+    nProt: get("nProt"),
+    chNFe: get("chNFe"),
   };
 }
 
-// =============================================================================
-// Endpoint: /health
-// =============================================================================
-app.get("/health", (req, res) => {
-  res.json({
-    ok: true,
-    ts: Date.now(),
-    ca_bundle_size: CA_BUNDLE.length,
-    icp_brasil_loaded:
-      ICP_BRASIL_CA.includes("BEGIN CERTIFICATE") &&
-      !ICP_BRASIL_CA.includes("COLE_AQUI"),
-  });
+// ============================================================
+// 11. Express
+// ============================================================
+const app = express();
+app.use(express.json({ limit: "20mb" }));
+
+app.get("/health", (_req, res) => {
+  res.json({ ok: true, ts: new Date().toISOString() });
 });
 
-// =============================================================================
-// Endpoint: /transmitir
-// =============================================================================
 app.post("/transmitir", async (req, res) => {
-  if (!checkAuth(req, res)) return;
-
   const t0 = Date.now();
   try {
-    const {
-      ambiente = 2,
-      chave,
-      xml,
-      pfx_base64,
-      senha,
-      csc_id,
-      csc_token,
-    } = req.body || {};
+    const { tipo, ambiente, chave, xml, pfx_base64, senha, csc_id, csc_token } = req.body;
 
-    if (!xml || !pfx_base64 || !senha || !chave || !csc_id || !csc_token) {
-      return res.status(400).json({ error: "Parametros obrigatorios ausentes." });
+    if (!xml || !pfx_base64 || !senha) {
+      return res.status(400).json({ error: "Campos obrigatórios: xml, pfx_base64, senha" });
+    }
+    const amb = ambiente === "producao" ? "producao" : "homologacao";
+    const tpAmb = amb === "producao" ? "1" : "2";
+
+    console.log(`[${chave}] Iniciando transmissão (${amb})`);
+
+    // 1. PFX → PEM
+    const { keyPem, certPem } = pfxToPem(pfx_base64, senha);
+    console.log(`[${chave}] PFX convertido`);
+
+    // 2. Assina <infNFe>
+    const xmlAssinado = signNFe(xml, keyPem, certPem);
+    console.log(`[${chave}] XML assinado`);
+
+    // 3. Envelopa SEM infNFeSupl
+    const enviNFe = buildEnviNFe(xmlAssinado);
+    const soapXml = buildSoapEnvelope(enviNFe);
+    console.log(`[${chave}] Envelope SOAP montado (sem infNFeSupl)`);
+
+    // 4. Transmite
+    const pfxBuffer = Buffer.from(pfx_base64, "base64");
+    const url = SEFAZ_URLS[amb];
+    const { status, body } = await postSefaz(url, soapXml, pfxBuffer, senha);
+    console.log(`[${chave}] SEFAZ respondeu HTTP ${status} em ${Date.now() - t0}ms`);
+
+    // 5. Parse retorno
+    const retorno = parseRetorno(body);
+    console.log(`[${chave}] cStat=${retorno.cStat} xMotivo=${retorno.xMotivo}`);
+
+    // 6. Adiciona infNFeSupl no XML retornado (para banco/impressão)
+    let xmlFinal = xmlAssinado;
+    if (csc_id && csc_token) {
+      const { qrCode, urlChave } = buildQrCode(chave, tpAmb, csc_id, csc_token, amb);
+      xmlFinal = addInfNFeSupl(xmlAssinado, qrCode, urlChave);
+      console.log(`[${chave}] QR Code embutido no XML final`);
     }
 
-    console.log(`[transmitir] inicio chave=${chave} ambiente=${ambiente}`);
-
-    const { keyPem, certPem } = pfxToPem(pfx_base64, senha);
-    console.log(`[transmitir] pfx convertido para pem`);
-
-    const xmlAssinado = signNFe(xml, keyPem, certPem);
-    console.log(`[transmitir] xml assinado`);
-
-    const qrBase = SEFAZ_URLS.qrcode[ambiente];
-    const urlChave = SEFAZ_URLS.consultaChave[ambiente];
-    const qrCodeUrl = buildQrCode({ chave, ambiente, csc_id, csc_token, qrBase });
-    const xmlAssinadoComSupl = insertInfNFeSupl(xmlAssinado, qrCodeUrl, urlChave);
-    console.log(`[transmitir] infNFeSupl inserido apos Signature`);
-
-    const idLote = String(Date.now()).slice(-15);
-    const enviNFe = buildEnviNFe(xmlAssinadoComSupl, idLote);
-    const soap = buildSoapEnvelope(enviNFe);
-
-    const url = SEFAZ_URLS.autorizacao[ambiente];
-    console.log(`[transmitir] enviando para ${url}`);
-    const resp = await postSefaz({ url, body: soap, pfxBase64: pfx_base64, senha });
-    console.log(`[transmitir] resposta sefaz status=${resp.status} (${Date.now() - t0}ms)`);
-
-    const parsed = parseRetorno(resp.body);
-    console.log(`[transmitir] cStat=${parsed.cStat} xMotivo=${parsed.xMotivo}`);
-
     return res.json({
-      ok: true,
-      xml_assinado: xmlAssinadoComSupl,
-      xml_envelope: soap,
-      xml_retorno: resp.body,
-      http_status: resp.status,
-      ...parsed,
+      xml_assinado: xmlFinal,
+      xml_envelope: soapXml,
+      xml_retorno: body,
+      http_status: status,
+      cStat: retorno.cStat,
+      xMotivo: retorno.xMotivo,
+      nProt: retorno.nProt,
     });
   } catch (err) {
-    console.error(`[transmitir] erro:`, err);
-    return res.status(500).json({
-      error: err.message || String(err),
-      code: err.code || null,
-    });
+    console.error("Erro /transmitir:", err);
+    return res.status(500).json({ error: err.message, stack: err.stack });
   }
 });
 
-// =============================================================================
-// Start
-// =============================================================================
 const PORT = process.env.PORT || 10000;
-app.listen(PORT, () => {
-  console.log(`NFC-e Relay rodando na porta ${PORT}`);
-  console.log(`CA bundle: ${CA_BUNDLE.length} certificados (ICP-Brasil + sistema)`);
-});
+app.listen(PORT, () => console.log(`Relay SEFAZ-SP rodando na porta ${PORT}`));
