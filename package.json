@@ -1,21 +1,15 @@
 {
   "name": "sefaz-relay",
-  "version": "1.1.0",
-  "description": "Relay mTLS para transmissão de NFC-e à SEFAZ-SP com cadeia ICP-Brasil",
+  "version": "2.0.0",
   "main": "index.js",
-  "type": "commonjs",
-  "engines": {
-    "node": ">=20.0.0"
-  },
-  "scripts": {
-    "start": "node index.js",
-    "postinstall": "node scripts/download-cas.js || true",
-    "download-cas": "node scripts/download-cas.js"
-  },
+  "scripts": { "start": "node index.js" },
   "dependencies": {
-    "express": "^4.21.1",
+    "axios": "^1.7.0",
+    "express": "^4.19.2",
     "node-forge": "^1.3.1",
     "xml-crypto": "^6.0.0",
-    "@xmldom/xmldom": "^0.9.5"
-  }
+    "@xmldom/xmldom": "^0.8.10",
+    "xpath": "^0.0.34"
+  },
+  "engines": { "node": ">=20" }
 }
