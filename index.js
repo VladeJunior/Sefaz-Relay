@@ -1,8 +1,10 @@
 const express = require("express");
 const https = require("https");
+const tls = require("tls");
+const fs = require("fs");
+const path = require("path");
 const forge = require("node-forge");
 const { SignedXml } = require("xml-crypto");
-const { DOMParser, XMLSerializer } = require("@xmldom/xmldom");
 
 const app = express();
 app.use(express.json({ limit: "10mb" }));
@@ -15,9 +17,38 @@ if (!RELAY_TOKEN) {
   process.exit(1);
 }
 
-// ---------- Health check (Render usa para manter o serviço acordado) ----------
+// ---------- Trust store: Node defaults + ICP-Brasil ----------
+// Carrega o bundle ICP-Brasil (gerado pelo script ./scripts/download-cas.js no postinstall).
+// Se o arquivo não existir, segue só com as CAs padrão do Node (suficiente para muitos servidores SEFAZ
+// que já usam certificados emitidos por ACs públicas reconhecidas pela Mozilla).
+function loadIcpBrasilCAs() {
+  const bundlePath = path.join(__dirname, "certs", "icp-brasil-bundle.pem");
+  if (!fs.existsSync(bundlePath)) {
+    console.warn(
+      `[trust-store] Bundle ICP-Brasil não encontrado em ${bundlePath}. ` +
+        `Confiando apenas nas CAs padrão do Node. ` +
+        `Execute "node scripts/download-cas.js" para baixar a cadeia oficial.`
+    );
+    return [];
+  }
+  const raw = fs.readFileSync(bundlePath, "utf-8");
+  const certs = raw.match(/-----BEGIN CERTIFICATE-----[\s\S]+?-----END CERTIFICATE-----/g) || [];
+  console.log(`[trust-store] ICP-Brasil: ${certs.length} certificados carregados.`);
+  return certs;
+}
+
+const ICP_BRASIL_CAS = loadIcpBrasilCAs();
+// Combina CAs padrão do Node (Mozilla bundle) + ICP-Brasil
+const TRUSTED_CAS = [...tls.rootCertificates, ...ICP_BRASIL_CAS];
+
+// ---------- Health check ----------
 app.get("/health", (_req, res) => {
-  res.json({ status: "ok", uptime: process.uptime() });
+  res.json({
+    status: "ok",
+    uptime: process.uptime(),
+    trustedCAs: TRUSTED_CAS.length,
+    icpBrasilCAs: ICP_BRASIL_CAS.length,
+  });
 });
 
 // ---------- Auth middleware ----------
@@ -36,7 +67,6 @@ function extractPfx(pfxBase64, senha) {
   const pfxAsn1 = forge.asn1.fromDer(pfxDer);
   const p12 = forge.pkcs12.pkcs12FromAsn1(pfxAsn1, false, senha);
 
-  // Chave privada
   let privateKey = null;
   const keyBags = p12.getBags({ bagType: forge.pki.oids.pkcs8ShroudedKeyBag });
   const keyBagList = keyBags[forge.pki.oids.pkcs8ShroudedKeyBag] || [];
@@ -49,24 +79,20 @@ function extractPfx(pfxBase64, senha) {
   }
   if (!privateKey) throw new Error("Chave privada não encontrada no PFX.");
 
-  // Certificado
   const certBags = p12.getBags({ bagType: forge.pki.oids.certBag });
   const certList = certBags[forge.pki.oids.certBag] || [];
   if (certList.length === 0) throw new Error("Certificado não encontrado no PFX.");
   const certificate = certList[0].cert;
 
-  // PEM (para xml-crypto)
   const privateKeyPem = forge.pki.privateKeyToPem(privateKey);
   const certPem = forge.pki.certificateToPem(certificate);
-
-  // Base64 do cert (DER) para inserir no <X509Certificate>
   const certDer = forge.asn1.toDer(forge.pki.certificateToAsn1(certificate)).getBytes();
   const certBase64 = forge.util.encode64(certDer);
 
   return { privateKeyPem, certPem, certBase64 };
 }
 
-// ---------- Assina o XML conforme XMLDSig (NFe) ----------
+// ---------- Assinatura XMLDSig (NFe) ----------
 function assinarXml(xml, privateKeyPem, certBase64, referenceId) {
   const sig = new SignedXml({
     privateKey: privateKeyPem,
@@ -86,7 +112,6 @@ function assinarXml(xml, privateKeyPem, certBase64, referenceId) {
   sig.getKeyInfoContent = () =>
     `<X509Data><X509Certificate>${certBase64}</X509Certificate></X509Data>`;
 
-  // Assina e insere a tag Signature DENTRO de <NFe>, após </infNFe>
   sig.computeSignature(xml, {
     location: {
       reference: "//*[local-name(.)='NFe']",
@@ -97,9 +122,8 @@ function assinarXml(xml, privateKeyPem, certBase64, referenceId) {
   return sig.getSignedXml();
 }
 
-// ---------- Envelopa em SOAP e envia à SEFAZ via mTLS ----------
+// ---------- Envio à SEFAZ via mTLS ----------
 async function enviarSefaz({ xmlAssinado, ambiente, pfxBuffer, senha }) {
-  // Endpoint NFC-e SP (NFeAutorizacao4)
   const url =
     ambiente === "1"
       ? "https://nfe.fazenda.sp.gov.br/ws/nfeautorizacao4.asmx"
@@ -112,7 +136,8 @@ async function enviarSefaz({ xmlAssinado, ambiente, pfxBuffer, senha }) {
   const agent = new https.Agent({
     pfx: pfxBuffer,
     passphrase: senha,
-    rejectUnauthorized: true,
+    ca: TRUSTED_CAS,           // ← CAs padrão Node + ICP-Brasil
+    rejectUnauthorized: true,  // ← validação real (produção-ready)
     minVersion: "TLSv1.2",
   });
 
@@ -124,7 +149,8 @@ async function enviarSefaz({ xmlAssinado, ambiente, pfxBuffer, senha }) {
         method: "POST",
         agent,
         headers: {
-          "Content-Type": 'application/soap+xml; charset=utf-8; action="http://www.portalfiscal.inf.br/nfe/wsdl/NFeAutorizacao4/nfeAutorizacaoLote"',
+          "Content-Type":
+            'application/soap+xml; charset=utf-8; action="http://www.portalfiscal.inf.br/nfe/wsdl/NFeAutorizacao4/nfeAutorizacaoLote"',
           "Content-Length": Buffer.byteLength(soapEnvelope),
         },
       },
@@ -146,7 +172,6 @@ async function enviarSefaz({ xmlAssinado, ambiente, pfxBuffer, senha }) {
   });
   const tempo = Date.now() - start;
 
-  // Parse simples do retorno
   const body = response.body || "";
   const cStat = (body.match(/<cStat>(\d+)<\/cStat>/) || [])[1] || "";
   const xMotivo = (body.match(/<xMotivo>([^<]+)<\/xMotivo>/) || [])[1] || "";
@@ -172,19 +197,14 @@ app.post("/transmitir", checkToken, async (req, res) => {
 
     if (!xml || !pfx_base64 || !senha || !ambiente || !chave) {
       return res.status(400).json({
-        error:
-          "Campos obrigatórios: xml, pfx_base64, senha, ambiente, chave.",
+        error: "Campos obrigatórios: xml, pfx_base64, senha, ambiente, chave.",
       });
     }
 
-    // 1. Extrai chave/cert do PFX
     const { privateKeyPem, certBase64 } = extractPfx(pfx_base64, senha);
-
-    // 2. Assina o XML
     const referenceId = `NFe${chave}`;
     const xmlAssinado = assinarXml(xml, privateKeyPem, certBase64, referenceId);
 
-    // 3. Envia à SEFAZ via mTLS
     const pfxBuffer = Buffer.from(pfx_base64, "base64");
     const resultado = await enviarSefaz({
       xmlAssinado,
@@ -209,11 +229,11 @@ app.post("/transmitir", checkToken, async (req, res) => {
     console.error("Erro /transmitir:", err);
     return res.status(500).json({
       error: err.message || "Erro interno no relay.",
-      stack: process.env.NODE_ENV === "production" ? undefined : err.stack,
     });
   }
 });
 
 app.listen(PORT, () => {
   console.log(`SEFAZ relay rodando na porta ${PORT}`);
+  console.log(`Trust store: ${TRUSTED_CAS.length} CAs (${ICP_BRASIL_CAS.length} ICP-Brasil + ${tls.rootCertificates.length} Mozilla).`);
 });
