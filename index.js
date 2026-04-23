@@ -203,8 +203,14 @@ function signNFe(xmlNFe, keyPem, certPem) {
     ],
   });
 
+  // Posiciona <Signature> após <infNFeSupl> se existir; caso contrário após <infNFe>
+  const hasSupl = /<infNFeSupl[\s>]/.test(xmlNFe);
+  const refXpath = hasSupl
+    ? "//*[local-name(.)='infNFeSupl']"
+    : "//*[local-name(.)='infNFe']";
+
   sig.computeSignature(xmlNFe, {
-    location: { reference: "//*[local-name(.)='infNFe']", action: "after" },
+    location: { reference: refXpath, action: "after" },
   });
 
   return sig.getSignedXml();
@@ -222,11 +228,14 @@ function buildQrCode(chave, tpAmb, cscId, cscToken, ambiente) {
 }
 
 // ============================================================
-// 6. Adiciona <infNFeSupl> no XML JÁ ASSINADO (pós-transmissão)
-//    Posição correta: dentro de <NFe>, ANTES de <Signature>
+// 6. Insere <infNFeSupl> no XML ANTES de assinar
+//    Schema NFC-e 4.00: dentro de <NFe>, APÓS </infNFe> e ANTES de <Signature>
+//    Como assinamos depois, basta inserir como filho de <NFe> após <infNFe>;
+//    a Signature será posicionada após este nó pelo signNFe (action: "after" infNFe)
+//    NOTA: precisamos posicionar a Signature após infNFeSupl, não após infNFe.
 // ============================================================
-function addInfNFeSupl(xmlAssinado, qrCode, urlChave) {
-  const doc = new DOMParser().parseFromString(xmlAssinado, "text/xml");
+function addInfNFeSupl(xmlNFe, qrCode, urlChave) {
+  const doc = new DOMParser().parseFromString(xmlNFe, "text/xml");
   const nfe = doc.getElementsByTagName("NFe")[0];
   if (!nfe) throw new Error("Tag <NFe> não encontrada");
 
@@ -239,10 +248,11 @@ function addInfNFeSupl(xmlAssinado, qrCode, urlChave) {
   supl.appendChild(qr);
   supl.appendChild(url);
 
-  // Inserir antes de <Signature>
-  const sig = nfe.getElementsByTagName("Signature")[0];
-  if (sig) {
-    nfe.insertBefore(supl, sig);
+  // Inserir após <infNFe> (e antes de qualquer Signature, se houver)
+  const infNFe = nfe.getElementsByTagName("infNFe")[0];
+  if (!infNFe) throw new Error("Tag <infNFe> não encontrada");
+  if (infNFe.nextSibling) {
+    nfe.insertBefore(supl, infNFe.nextSibling);
   } else {
     nfe.appendChild(supl);
   }
@@ -379,38 +389,41 @@ app.post("/transmitir", async (req, res) => {
     const { keyPem, certPem } = pfxToPem(pfx_base64, senha);
     console.log(`[${chave}] PFX convertido`);
 
-    // 2. Assina <infNFe>
-    const xmlAssinado = signNFe(xml, keyPem, certPem);
+    // 2. Calcula QR Code e insere <infNFeSupl> ANTES de assinar
+    //    (NFC-e exige infNFeSupl no XML transmitido — senão rejeição 394)
+    let xmlComSupl = xml;
+    if (csc_id && csc_token) {
+      const { qrCode, urlChave } = buildQrCode(chave, tpAmb, csc_id, csc_token, amb);
+      xmlComSupl = addInfNFeSupl(xml, qrCode, urlChave);
+      console.log(`[${chave}] infNFeSupl inserido (QR Code)`);
+    } else {
+      console.log(`[${chave}] AVISO: CSC ausente — XML será enviado SEM infNFeSupl`);
+    }
+
+    // 3. Assina <infNFe> (Signature posicionada após infNFeSupl)
+    const xmlAssinado = signNFe(xmlComSupl, keyPem, certPem);
     console.log(`[${chave}] XML assinado`);
 
-    // 3. Envelopa SEM infNFeSupl
+    // 4. Envelopa COM infNFeSupl + Signature
     const enviNFe = buildEnviNFe(xmlAssinado);
     const soapXml = buildSoapEnvelope(enviNFe);
-    console.log(`[${chave}] Envelope SOAP montado (sem infNFeSupl)`);
+    console.log(`[${chave}] Envelope SOAP montado (com infNFeSupl)`);
 
-    // 4. Transmite
+    // 5. Transmite
     const pfxBuffer = Buffer.from(pfx_base64, "base64");
     const url = SEFAZ_URLS[amb];
     const { status, body } = await postSefaz(url, soapXml, pfxBuffer, senha);
     console.log(`[${chave}] SEFAZ respondeu HTTP ${status} em ${Date.now() - t0}ms`);
 
-    // 5. Parse retorno
+    // 6. Parse retorno
     const retorno = parseRetorno(body);
     if (retorno.cStatLote && retorno.cStatLote !== retorno.cStat) {
       console.log(`[${chave}] LOTE cStat=${retorno.cStatLote} xMotivo=${retorno.xMotivoLote}`);
     }
     console.log(`[${chave}] NOTA cStat=${retorno.cStat} xMotivo=${retorno.xMotivo}`);
 
-    // 6. Adiciona infNFeSupl no XML retornado (para banco/impressão)
-    let xmlFinal = xmlAssinado;
-    if (csc_id && csc_token) {
-      const { qrCode, urlChave } = buildQrCode(chave, tpAmb, csc_id, csc_token, amb);
-      xmlFinal = addInfNFeSupl(xmlAssinado, qrCode, urlChave);
-      console.log(`[${chave}] QR Code embutido no XML final`);
-    }
-
     return res.json({
-      xml_assinado: xmlFinal,
+      xml_assinado: xmlAssinado,
       xml_envelope: soapXml,
       xml_retorno: body,
       http_status: status,
