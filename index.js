@@ -1,7 +1,5 @@
 // =============================================================================
 // NFC-e Relay SP — Render
-// Responsável por: assinar XML com PFX, montar envelope SOAP, transmitir à
-// SEFAZ-SP via mTLS, retornar resposta crua à Edge Function do Supabase.
 // =============================================================================
 
 const express = require("express");
@@ -17,9 +15,8 @@ app.use(express.json({ limit: "20mb" }));
 
 // =============================================================================
 // CA BUNDLE — ICP-Brasil
-// SUBSTITUA o conteúdo abaixo pelos PEMs reais das raízes ICP-Brasil v2/v5/v10
-// baixadas em: https://www.gov.br/iti/pt-br/assuntos/repositorio/repositorio-ac-raiz
-// Concatene as três raízes (uma após a outra) dentro da string.
+// SUBSTITUA o conteudo abaixo pelos PEMs reais das raizes ICP-Brasil v2/v5/v10
+// Baixe em: https://www.gov.br/iti/pt-br/assuntos/repositorio/repositorio-ac-raiz
 // =============================================================================
 const ICP_BRASIL_CA = `
 -----BEGIN CERTIFICATE-----
@@ -136,7 +133,6 @@ iyGEsgKULkCH4o2Vgl1gQuKWO4V68rFW8a/jvq28sbY+y/Ao0I5ohpnBcQOAawiF
 bz6yJtObajYMuztDDP8oY656EuuJXBJhuKAJPI/7WDtgfV8ffOh/iQGQATVMtgDN
 0gv8bn5NdUX8UMNX1sHhU3H1UpoW
 -----END CERTIFICATE-----
-
 `.trim();
 
 const CA_BUNDLE = [ICP_BRASIL_CA, ...tls.rootCertificates];
@@ -160,12 +156,12 @@ const SEFAZ_URLS = {
 };
 
 // =============================================================================
-// Auth simples por Bearer token (mesmo SEFAZ_RELAY_TOKEN da Edge Function)
+// Auth Bearer token
 // =============================================================================
 const RELAY_TOKEN = process.env.RELAY_TOKEN || process.env.SEFAZ_RELAY_TOKEN || "";
 
 function checkAuth(req, res) {
-  if (!RELAY_TOKEN) return true; // sem token configurado, não exige
+  if (!RELAY_TOKEN) return true;
   const auth = req.headers["authorization"] || "";
   const expected = `Bearer ${RELAY_TOKEN}`;
   if (auth !== expected) {
@@ -176,7 +172,7 @@ function checkAuth(req, res) {
 }
 
 // =============================================================================
-// Util: extrair chave PEM e cert PEM do PFX (base64)
+// PFX -> PEM
 // =============================================================================
 function pfxToPem(pfxBase64, senha) {
   const pfxDer = forge.util.decode64(pfxBase64);
@@ -200,15 +196,14 @@ function pfxToPem(pfxBase64, senha) {
   }
 
   if (!keyPem || !certPem) {
-    throw new Error("PFX não contém chave privada ou certificado.");
+    throw new Error("PFX nao contem chave privada ou certificado.");
   }
 
   return { keyPem, certPem, caCerts };
 }
 
 // =============================================================================
-// Util: assinar <infNFe> dentro de <NFe>
-// Resultado: <NFe> ... <infNFe>...</infNFe> <Signature>...</Signature> </NFe>
+// Assinar <infNFe>
 // =============================================================================
 function signNFe(xmlNFe, keyPem, certPem) {
   const certB64 = certPem
@@ -248,12 +243,9 @@ function extractInfNFeId(xml) {
 }
 
 // =============================================================================
-// Util: QR Code NFC-e 4.00 — tpEmis=1 (online)
-// Formato:
-//   paramUrl   = chNFe|nVersao|tpAmb               (3 campos, SEM cIdToken)
-//   stringHash = chNFe|nVersao|tpAmb|cIdToken|CSC  (cIdToken + CSC entram só no hash)
-//   hash       = SHA1_HEX_UPPER(stringHash)
-//   URL        = <base>?p=paramUrl|hash
+// QR Code NFC-e 4.00 (tpEmis=1)
+// paramUrl   = chNFe|nVersao|tpAmb               (SEM cIdToken)
+// stringHash = chNFe|nVersao|tpAmb|cIdToken|CSC  (cIdToken+CSC so no hash)
 // =============================================================================
 function buildQrCode({ chave, ambiente, csc_id, csc_token, qrBase }) {
   const tpAmb = String(ambiente);
@@ -266,13 +258,13 @@ function buildQrCode({ chave, ambiente, csc_id, csc_token, qrBase }) {
 }
 
 // =============================================================================
-// Util: inserir <infNFeSupl> DEPOIS de <Signature>
-// Ordem correta NFC-e 4.00: infNFe → Signature → infNFeSupl
+// inserir <infNFeSupl> DEPOIS de <Signature>
+// Ordem correta NFC-e 4.00: infNFe -> Signature -> infNFeSupl
 // =============================================================================
 function insertInfNFeSupl(xmlNFeAssinado, qrCodeUrl, urlChave) {
   const doc = new DOMParser().parseFromString(xmlNFeAssinado, "text/xml");
   const nfe = doc.getElementsByTagName("NFe")[0];
-  if (!nfe) throw new Error("Tag <NFe> não encontrada para inserir infNFeSupl.");
+  if (!nfe) throw new Error("Tag <NFe> nao encontrada para inserir infNFeSupl.");
 
   const supl = doc.createElement("infNFeSupl");
   const qr = doc.createElement("qrCode");
@@ -285,4 +277,186 @@ function insertInfNFeSupl(xmlNFeAssinado, qrCodeUrl, urlChave) {
   const signature = nfe.getElementsByTagName("Signature")[0];
   if (signature) {
     if (signature.nextSibling) {
-      nfe.insertBefore(supl,
+      nfe.insertBefore(supl, signature.nextSibling);
+    } else {
+      nfe.appendChild(supl);
+    }
+  } else {
+    nfe.appendChild(supl);
+  }
+
+  return new XMLSerializer().serializeToString(doc);
+}
+
+// =============================================================================
+// Envelopes enviNFe + SOAP 1.2
+// =============================================================================
+function buildEnviNFe(xmlNFeAssinadoComSupl, idLote) {
+  return `<?xml version="1.0" encoding="UTF-8"?>` +
+    `<enviNFe xmlns="http://www.portalfiscal.inf.br/nfe" versao="4.00">` +
+    `<idLote>${idLote}</idLote>` +
+    `<indSinc>1</indSinc>` +
+    `${xmlNFeAssinadoComSupl.replace(/<\?xml[^>]*\?>/, "")}` +
+    `</enviNFe>`;
+}
+
+function buildSoapEnvelope(enviNFeXml) {
+  return `<?xml version="1.0" encoding="UTF-8"?>` +
+    `<soap12:Envelope xmlns:soap12="http://www.w3.org/2003/05/soap-envelope" xmlns:nfe="http://www.portalfiscal.inf.br/nfe/wsdl/NFeAutorizacao4">` +
+    `<soap12:Body>` +
+    `<nfe:nfeDadosMsg>${enviNFeXml.replace(/<\?xml[^>]*\?>/, "")}</nfe:nfeDadosMsg>` +
+    `</soap12:Body>` +
+    `</soap12:Envelope>`;
+}
+
+// =============================================================================
+// POST mTLS para SEFAZ
+// =============================================================================
+function postSefaz({ url, body, pfxBase64, senha }) {
+  return new Promise((resolve, reject) => {
+    const u = new URL(url);
+    const agent = new https.Agent({
+      pfx: Buffer.from(pfxBase64, "base64"),
+      passphrase: senha,
+      ca: CA_BUNDLE,
+      keepAlive: true,
+      rejectUnauthorized: true,
+      minVersion: "TLSv1.2",
+    });
+
+    const req = https.request(
+      {
+        host: u.hostname,
+        port: u.port || 443,
+        path: u.pathname + u.search,
+        method: "POST",
+        agent,
+        headers: {
+          "Content-Type": "application/soap+xml; charset=utf-8",
+          "Content-Length": Buffer.byteLength(body, "utf8"),
+          "SOAPAction":
+            "http://www.portalfiscal.inf.br/nfe/wsdl/NFeAutorizacao4/nfeAutorizacaoLote",
+        },
+      },
+      (res) => {
+        const chunks = [];
+        res.on("data", (c) => chunks.push(c));
+        res.on("end", () => {
+          resolve({
+            status: res.statusCode,
+            headers: res.headers,
+            body: Buffer.concat(chunks).toString("utf8"),
+          });
+        });
+      }
+    );
+
+    req.on("error", reject);
+    req.write(body);
+    req.end();
+  });
+}
+
+// =============================================================================
+// Extrair cStat / nProt / xMotivo
+// =============================================================================
+function parseRetorno(xmlRetorno) {
+  const grab = (tag) => {
+    const m = xmlRetorno.match(new RegExp(`<${tag}[^>]*>([^<]+)</${tag}>`));
+    return m ? m[1] : null;
+  };
+  return {
+    cStat: grab("cStat"),
+    xMotivo: grab("xMotivo"),
+    nProt: grab("nProt"),
+    chNFe: grab("chNFe"),
+  };
+}
+
+// =============================================================================
+// Endpoint: /health
+// =============================================================================
+app.get("/health", (req, res) => {
+  res.json({
+    ok: true,
+    ts: Date.now(),
+    ca_bundle_size: CA_BUNDLE.length,
+    icp_brasil_loaded:
+      ICP_BRASIL_CA.includes("BEGIN CERTIFICATE") &&
+      !ICP_BRASIL_CA.includes("COLE_AQUI"),
+  });
+});
+
+// =============================================================================
+// Endpoint: /transmitir
+// =============================================================================
+app.post("/transmitir", async (req, res) => {
+  if (!checkAuth(req, res)) return;
+
+  const t0 = Date.now();
+  try {
+    const {
+      ambiente = 2,
+      chave,
+      xml,
+      pfx_base64,
+      senha,
+      csc_id,
+      csc_token,
+    } = req.body || {};
+
+    if (!xml || !pfx_base64 || !senha || !chave || !csc_id || !csc_token) {
+      return res.status(400).json({ error: "Parametros obrigatorios ausentes." });
+    }
+
+    console.log(`[transmitir] inicio chave=${chave} ambiente=${ambiente}`);
+
+    const { keyPem, certPem } = pfxToPem(pfx_base64, senha);
+    console.log(`[transmitir] pfx convertido para pem`);
+
+    const xmlAssinado = signNFe(xml, keyPem, certPem);
+    console.log(`[transmitir] xml assinado`);
+
+    const qrBase = SEFAZ_URLS.qrcode[ambiente];
+    const urlChave = SEFAZ_URLS.consultaChave[ambiente];
+    const qrCodeUrl = buildQrCode({ chave, ambiente, csc_id, csc_token, qrBase });
+    const xmlAssinadoComSupl = insertInfNFeSupl(xmlAssinado, qrCodeUrl, urlChave);
+    console.log(`[transmitir] infNFeSupl inserido apos Signature`);
+
+    const idLote = String(Date.now()).slice(-15);
+    const enviNFe = buildEnviNFe(xmlAssinadoComSupl, idLote);
+    const soap = buildSoapEnvelope(enviNFe);
+
+    const url = SEFAZ_URLS.autorizacao[ambiente];
+    console.log(`[transmitir] enviando para ${url}`);
+    const resp = await postSefaz({ url, body: soap, pfxBase64: pfx_base64, senha });
+    console.log(`[transmitir] resposta sefaz status=${resp.status} (${Date.now() - t0}ms)`);
+
+    const parsed = parseRetorno(resp.body);
+    console.log(`[transmitir] cStat=${parsed.cStat} xMotivo=${parsed.xMotivo}`);
+
+    return res.json({
+      ok: true,
+      xml_assinado: xmlAssinadoComSupl,
+      xml_envelope: soap,
+      xml_retorno: resp.body,
+      http_status: resp.status,
+      ...parsed,
+    });
+  } catch (err) {
+    console.error(`[transmitir] erro:`, err);
+    return res.status(500).json({
+      error: err.message || String(err),
+      code: err.code || null,
+    });
+  }
+});
+
+// =============================================================================
+// Start
+// =============================================================================
+const PORT = process.env.PORT || 10000;
+app.listen(PORT, () => {
+  console.log(`NFC-e Relay rodando na porta ${PORT}`);
+  console.log(`CA bundle: ${CA_BUNDLE.length} certificados (ICP-Brasil + sistema)`);
+});
