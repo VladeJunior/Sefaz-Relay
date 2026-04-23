@@ -223,7 +223,12 @@ function buildQrCode(chave, tpAmb, cscId, cscToken, ambiente) {
 
 // ============================================================
 // 6. Adiciona <infNFeSupl> no XML JÁ ASSINADO
-//    Ordem correta do schema NFC-e: <infNFe> <Signature> <infNFeSupl>
+//    Ordem CORRETA do schema NFC-e v4.00:
+//      <NFe>
+//        <infNFe>...</infNFe>
+//        <infNFeSupl>...</infNFeSupl>   <-- ANTES da Signature
+//        <Signature>...</Signature>
+//      </NFe>
 // ============================================================
 function addInfNFeSupl(xmlAssinado, qrCode, urlChave) {
   const doc = new DOMParser().parseFromString(xmlAssinado, "text/xml");
@@ -239,27 +244,20 @@ function addInfNFeSupl(xmlAssinado, qrCode, urlChave) {
   supl.appendChild(qr);
   supl.appendChild(url);
 
+  // Inserir SEMPRE antes de <Signature> (e depois de </infNFe>)
   const sig = nfe.getElementsByTagName("Signature")[0];
   if (sig) {
-    if (sig.nextSibling) {
-      nfe.insertBefore(supl, sig.nextSibling);
-    } else {
-      nfe.appendChild(supl);
-    }
+    nfe.insertBefore(supl, sig);
     return new XMLSerializer().serializeToString(doc);
   }
 
+  // Sem Signature: insere após infNFe
   const infNFe = nfe.getElementsByTagName("infNFe")[0];
-  if (infNFe) {
-    if (infNFe.nextSibling) {
-      nfe.insertBefore(supl, infNFe.nextSibling);
-    } else {
-      nfe.appendChild(supl);
-    }
+  if (infNFe && infNFe.nextSibling) {
+    nfe.insertBefore(supl, infNFe.nextSibling);
   } else {
     nfe.appendChild(supl);
   }
-
   return new XMLSerializer().serializeToString(doc);
 }
 
@@ -267,11 +265,16 @@ function addInfNFeSupl(xmlAssinado, qrCode, urlChave) {
 // 7. Envelope <enviNFe> (com a NFe completa que será transmitida)
 // ============================================================
 function buildEnviNFe(xmlNFeAssinada) {
+  // Remove declaração XML e o xmlns duplicado de <NFe> (já está no <enviNFe>).
+  // Manter dois xmlns iguais aninhados quebra o schema (rejeição 225).
+  const inner = xmlNFeAssinada
+    .replace(/<\?xml[^>]*\?>/, "")
+    .replace(/<NFe\s+xmlns="http:\/\/www\.portalfiscal\.inf\.br\/nfe"\s*>/, "<NFe>");
   return `<?xml version="1.0" encoding="UTF-8"?>` +
     `<enviNFe xmlns="http://www.portalfiscal.inf.br/nfe" versao="4.00">` +
     `<idLote>1</idLote>` +
     `<indSinc>1</indSinc>` +
-    xmlNFeAssinada.replace(/<\?xml[^>]*\?>/, "") +
+    inner +
     `</enviNFe>`;
 }
 
@@ -362,7 +365,7 @@ function validateNFeNode(nfeNode, { ambiente, requireQrCode }, errors) {
   assertValid(nfeNode.namespaceURI === NFE_NS, `Namespace de <NFe> inválido: ${nfeNode.namespaceURI || "ausente"}`, errors);
 
   const expectedOrder = requireQrCode
-    ? ["infNFe", "Signature", "infNFeSupl"]
+    ? ["infNFe", "infNFeSupl", "Signature"]
     : ["infNFe", "Signature"];
   assertChildOrder(nfeNode, expectedOrder, "<NFe>", errors);
 
