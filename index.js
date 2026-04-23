@@ -289,6 +289,180 @@ function buildSoapEnvelope(enviNFe) {
 }
 
 // ============================================================
+// 9. Validação local do XML antes de transmitir
+// ============================================================
+const NFE_NS = "http://www.portalfiscal.inf.br/nfe";
+const DSIG_NS = "http://www.w3.org/2000/09/xmldsig#";
+
+function parseXmlStrict(xml, label) {
+  const issues = [];
+  const doc = new DOMParser({
+    errorHandler: {
+      warning: (msg) => issues.push(`${label}: ${msg}`),
+      error: (msg) => issues.push(`${label}: ${msg}`),
+      fatalError: (msg) => issues.push(`${label}: ${msg}`),
+    },
+  }).parseFromString(xml, "application/xml");
+
+  const parserErrors = doc.getElementsByTagName("parsererror");
+  for (let i = 0; i < parserErrors.length; i++) {
+    issues.push(`${label}: ${parserErrors[i].textContent || "parsererror"}`);
+  }
+
+  if (issues.length > 0) {
+    throw new Error(issues.join(" | "));
+  }
+
+  return doc;
+}
+
+function getLocalName(node) {
+  if (!node) return null;
+  return node.localName || String(node.nodeName || "").split(":").pop() || null;
+}
+
+function getElementChildren(node) {
+  const children = [];
+  for (let i = 0; i < node.childNodes.length; i++) {
+    const child = node.childNodes[i];
+    if (child.nodeType === 1) children.push(child);
+  }
+  return children;
+}
+
+function getDirectChild(node, localName) {
+  return getElementChildren(node).find((child) => getLocalName(child) === localName) || null;
+}
+
+function getDirectChildNames(node) {
+  return getElementChildren(node).map((child) => getLocalName(child));
+}
+
+function getDeepFirst(node, localName) {
+  const all = node.getElementsByTagName("*");
+  for (let i = 0; i < all.length; i++) {
+    if (getLocalName(all[i]) === localName) return all[i];
+  }
+  return null;
+}
+
+function assertValid(condition, message, errors) {
+  if (!condition) errors.push(message);
+}
+
+function assertChildOrder(node, expected, label, errors) {
+  const actual = getDirectChildNames(node);
+  if (actual.join(">") !== expected.join(">")) {
+    errors.push(`${label}: ordem inválida (${actual.join(" > ") || "vazio"}); esperado (${expected.join(" > ")})`);
+  }
+}
+
+function validateNFeNode(nfeNode, { ambiente, requireQrCode }, errors) {
+  assertValid(getLocalName(nfeNode) === "NFe", "Raiz do documento deve ser <NFe>", errors);
+  assertValid(nfeNode.namespaceURI === NFE_NS, `Namespace de <NFe> inválido: ${nfeNode.namespaceURI || "ausente"}`, errors);
+
+  const expectedOrder = requireQrCode
+    ? ["infNFe", "Signature", "infNFeSupl"]
+    : ["infNFe", "Signature"];
+  assertChildOrder(nfeNode, expectedOrder, "<NFe>", errors);
+
+  const infNFe = getDirectChild(nfeNode, "infNFe");
+  const signature = getDirectChild(nfeNode, "Signature");
+  const infNFeSupl = getDirectChild(nfeNode, "infNFeSupl");
+
+  assertValid(!!infNFe, "Elemento <infNFe> ausente", errors);
+  assertValid(!!signature, "Elemento <Signature> ausente", errors);
+
+  if (infNFe) {
+    assertValid(infNFe.getAttribute("versao") === "4.00", `infNFe@versao inválido: ${infNFe.getAttribute("versao") || "ausente"}`, errors);
+    const infNFeId = infNFe.getAttribute("Id");
+    assertValid(/^NFe\d{44}$/.test(infNFeId || ""), `infNFe@Id inválido: ${infNFeId || "ausente"}`, errors);
+
+    if (signature) {
+      const ref = getDeepFirst(signature, "Reference");
+      const uri = ref?.getAttribute("URI") || "";
+      assertValid(uri === `#${infNFeId}`, `Reference URI da assinatura inválido: ${uri || "ausente"}`, errors);
+    }
+  }
+
+  if (signature) {
+    assertValid(signature.namespaceURI === DSIG_NS, `Namespace de <Signature> inválido: ${signature.namespaceURI || "ausente"}`, errors);
+    assertValid(!!getDeepFirst(signature, "SignedInfo"), "SignedInfo ausente na assinatura", errors);
+    assertValid(!!getDeepFirst(signature, "SignatureValue"), "SignatureValue ausente na assinatura", errors);
+    assertValid(!!getDeepFirst(signature, "X509Certificate"), "X509Certificate ausente na assinatura", errors);
+  }
+
+  if (requireQrCode) {
+    assertValid(!!infNFeSupl, "Elemento <infNFeSupl> ausente", errors);
+    if (infNFeSupl) {
+      assertChildOrder(infNFeSupl, ["qrCode", "urlChave"], "<infNFeSupl>", errors);
+      const qrCode = getDirectChild(infNFeSupl, "qrCode");
+      const urlChave = getDirectChild(infNFeSupl, "urlChave");
+      const qrCodeText = String(qrCode?.textContent || "").trim();
+      const urlChaveText = String(urlChave?.textContent || "").trim();
+
+      assertValid(!!qrCodeText, "qrCode vazio em infNFeSupl", errors);
+      assertValid(qrCodeText.startsWith(`${QR_BASE[ambiente]}?p=`), `qrCode fora do padrão esperado: ${qrCodeText || "vazio"}`, errors);
+      assertValid(urlChaveText === QR_BASE[ambiente], `urlChave inválida: ${urlChaveText || "vazia"}`, errors);
+    }
+  }
+}
+
+function validateNFeXml(xmlNFe, options) {
+  const doc = parseXmlStrict(xmlNFe, "NFe");
+  const errors = [];
+  validateNFeNode(doc.documentElement, options, errors);
+  if (errors.length > 0) throw new Error(errors.join(" | "));
+}
+
+function validateEnviNFeXml(xmlEnviNFe, options) {
+  const doc = parseXmlStrict(xmlEnviNFe, "enviNFe");
+  const errors = [];
+  const root = doc.documentElement;
+
+  assertValid(getLocalName(root) === "enviNFe", `Raiz do lote inválida: ${getLocalName(root) || "ausente"}`, errors);
+  assertValid(root.namespaceURI === NFE_NS, `Namespace de <enviNFe> inválido: ${root.namespaceURI || "ausente"}`, errors);
+  assertValid(root.getAttribute("versao") === "4.00", `enviNFe@versao inválido: ${root.getAttribute("versao") || "ausente"}`, errors);
+  assertChildOrder(root, ["idLote", "indSinc", "NFe"], "<enviNFe>", errors);
+
+  const idLote = getDirectChild(root, "idLote");
+  const indSinc = getDirectChild(root, "indSinc");
+  const nfe = getDirectChild(root, "NFe");
+
+  assertValid(/^\d{1,15}$/.test(String(idLote?.textContent || "").trim()), `idLote inválido: ${String(idLote?.textContent || "").trim() || "ausente"}`, errors);
+  assertValid(["0", "1"].includes(String(indSinc?.textContent || "").trim()), `indSinc inválido: ${String(indSinc?.textContent || "").trim() || "ausente"}`, errors);
+  assertValid(!!nfe, "Elemento <NFe> ausente em enviNFe", errors);
+
+  if (nfe) validateNFeNode(nfe, options, errors);
+  if (errors.length > 0) throw new Error(errors.join(" | "));
+}
+
+function validateSoapEnvelopeXml(soapXml) {
+  const doc = parseXmlStrict(soapXml, "SOAP");
+  const errors = [];
+  const envelope = doc.documentElement;
+
+  assertValid(getLocalName(envelope) === "Envelope", `Raiz do SOAP inválida: ${getLocalName(envelope) || "ausente"}`, errors);
+  const body = getDeepFirst(envelope, "Body");
+  assertValid(!!body, "Body ausente no SOAP", errors);
+
+  const nfeDadosMsg = body ? getDeepFirst(body, "nfeDadosMsg") : null;
+  assertValid(!!nfeDadosMsg, "nfeDadosMsg ausente no SOAP", errors);
+
+  const enviNFe = nfeDadosMsg ? getDirectChild(nfeDadosMsg, "enviNFe") : null;
+  assertValid(!!enviNFe, "enviNFe ausente dentro de nfeDadosMsg", errors);
+
+  if (errors.length > 0) throw new Error(errors.join(" | "));
+}
+
+function validateBeforeSend({ xmlNFe, enviNFe, soapXml, ambiente, requireQrCode }) {
+  validateNFeXml(xmlNFe, { ambiente, requireQrCode });
+  validateEnviNFeXml(enviNFe, { ambiente, requireQrCode });
+  validateSoapEnvelopeXml(soapXml);
+  return ["NFe", "enviNFe", "SOAP"];
+}
+
+// ============================================================
 // 9. Transmissão SEFAZ
 // ============================================================
 function postSefaz(url, soapXml, pfxBuffer, senha) {
@@ -409,6 +583,16 @@ app.post("/transmitir", async (req, res) => {
     const soapXml = buildSoapEnvelope(enviNFe);
     console.log(`[${chave}] Envelope SOAP montado (com infNFeSupl)`);
 
+    // 4.1 Validação local do XML/lote antes de transmitir
+    const etapasValidadas = validateBeforeSend({
+      xmlNFe: xmlTransmitido,
+      enviNFe,
+      soapXml,
+      ambiente: amb,
+      requireQrCode: Boolean(csc_id && csc_token),
+    });
+    console.log(`[${chave}] Validação local OK (${etapasValidadas.join(", ")})`);
+
     // 5. Transmite
     const pfxBuffer = Buffer.from(pfx_base64, "base64");
     const url = SEFAZ_URLS[amb];
@@ -433,7 +617,28 @@ app.post("/transmitir", async (req, res) => {
     });
   } catch (err) {
     console.error("Erro /transmitir:", err);
-    return res.status(500).json({ error: err.message, stack: err.stack });
+    const message = err?.message || "Erro interno";
+    const isLocalValidation = message.includes("Namespace") ||
+      message.includes("ordem inválida") ||
+      message.includes("infNFe") ||
+      message.includes("Signature") ||
+      message.includes("SOAP") ||
+      message.includes("enviNFe") ||
+      message.includes("qrCode") ||
+      message.includes("urlChave") ||
+      message.includes("Reference URI") ||
+      message.includes("parsererror");
+
+    if (isLocalValidation) {
+      return res.status(422).json({
+        error: `Falha de validação local do XML NFC-e: ${message}`,
+        etapa: "validacao_local_xml",
+        cStat: "225-local",
+        xMotivo: message,
+      });
+    }
+
+    return res.status(500).json({ error: message, stack: err.stack });
   }
 });
 
