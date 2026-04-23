@@ -1,56 +1,99 @@
-# SEFAZ Relay — NFC-e SP
+# Relay SEFAZ-SP NFC-e v5 — com Validação XSD Oficial
 
-Microserviço Node.js que recebe XML não assinado da Edge Function (Lovable Cloud / Supabase),
-assina com certificado A1 (PFX) via XMLDSig e transmite à SEFAZ-SP por mTLS.
+## O que mudou em relação à v4
 
-## Deploy no Render.com
+A grande mudança: **o relay agora valida o XML contra o XSD oficial da SEFAZ ANTES de transmitir**. Isso elimina o ciclo de "mandar e receber cStat 225 sem saber o motivo".
 
-1. Suba este diretório para um repositório GitHub.
-2. Render.com → **New → Web Service** → conecte o repo → plano **Free**.
-3. Build Command: `npm install` *(o postinstall baixa automaticamente as cadeias raiz da ICP-Brasil)*
-4. Start Command: `npm start`
-5. Em **Environment**, adicione:
-   - `RELAY_TOKEN` = (mesmo valor do secret `SEFAZ_RELAY_TOKEN` no Lovable)
-6. Após deploy, acesse `https://<seu-app>.onrender.com/health` e confira o JSON:
-   ```json
-   { "status": "ok", "trustedCAs": 149, "icpBrasilCAs": 3 }
-   ```
-   Se `icpBrasilCAs` aparecer como `0`, rode manualmente no shell do Render:
-   `node scripts/download-cas.js` e faça redeploy.
+Quando o XML é inválido, o relay retorna **HTTP 422** com o elemento exato, linha e coluna do erro — em vez do genérico `cStat=225 Falha no Schema XML do lote de NFe` que a SEFAZ devolve.
 
-## Endpoints
+## Setup no Render (ou em qualquer Node 18+)
 
-- `GET /health` — status público
-- `POST /transmitir` — protegido por `Authorization: Bearer <RELAY_TOKEN>`
-  ```json
-  {
-    "xml": "<NFe>...</NFe>",
-    "pfx_base64": "...",
-    "senha": "...",
-    "ambiente": "2",
-    "chave": "35261112345678000199650010000000019100000018"
-  }
-  ```
+### 1. Substitua os PEMs de CA Raiz no `index.js`
 
-## Trust store (resolução do erro `unable to get local issuer certificate`)
+Procure por `COLE_AQUI_O_PEM_DA_AC_RAIZ_V2/V5/V10` e cole os PEMs reais que você já vinha usando na v4.
 
-O servidor combina:
-- **CAs padrão da Mozilla** embutidas no Node (`tls.rootCertificates`, ~146 CAs).
-- **AC Raiz ICP-Brasil v2, v5 e v10**, baixadas em build-time via `scripts/download-cas.js` de
-  `acraiz.icpbrasil.gov.br`.
+### 2. Baixe os schemas XSD oficiais
 
-Isso permite validar a cadeia do servidor SEFAZ sem desabilitar `rejectUnauthorized`.
+Crie a pasta `schemes/PL_009_V4/` e coloque dentro dela os arquivos abaixo (todos do repositório oficial `nfephp-org/sped-nfe`):
 
-## Atualizar cadeias manualmente
+- `nfe_v4.00.xsd`
+- `leiauteNFe_v4.00.xsd`
+- `tiposBasico_v4.00.xsd`
+- `xmldsig-core-schema_v1.01.xsd`
+- `enviNFe_v4.00.xsd`
+
+Comando rápido (Render terminal ou local):
 
 ```bash
-node scripts/download-cas.js
+mkdir -p schemes/PL_009_V4
+cd schemes/PL_009_V4
+BASE="https://raw.githubusercontent.com/nfephp-org/sped-nfe/master/schemes/PL_009_V4"
+for f in nfe_v4.00.xsd leiauteNFe_v4.00.xsd tiposBasico_v4.00.xsd xmldsig-core-schema_v1.01.xsd enviNFe_v4.00.xsd; do
+  curl -sLO "$BASE/$f"
+done
 ```
 
-Recomendado revisitar a cada 12 meses ou quando a SEFAZ trocar de AC.
+### 3. Instalar dependências
 
-## Segurança
+```bash
+npm install
+```
 
-- Stateless: o PFX nunca é gravado em disco; usado em memória e descartado.
-- Token bearer obrigatório em `/transmitir`.
-- TLS 1.2+ obrigatório no envio à SEFAZ.
+A nova dependência é `libxmljs2`, que faz a validação XSD usando libxml2 nativo (mesmo motor que validadores oficiais usam).
+
+### 4. Subir
+
+```bash
+npm start
+```
+
+Ou, no Render, basta dar push — o `Procfile`/start padrão já roda `node index.js`.
+
+## Verificando que está tudo certo
+
+```bash
+curl https://SEU-RELAY.onrender.com/health
+```
+
+Deve responder algo como:
+
+```json
+{
+  "ok": true,
+  "ts": "2026-04-23T22:00:00.000Z",
+  "schemas": { "nfe": true, "enviNFe": true }
+}
+```
+
+Se aparecer `nfe: false`, é porque os XSDs não foram encontrados — confira a pasta `schemes/PL_009_V4/`.
+
+## Como o erro vai aparecer no app a partir de agora
+
+Antes:
+```
+NFC-e rejeitada: Falha no Schema XML do lote de NFe
+```
+
+Agora:
+```
+Schema XSD local (etapa nfe_v4.00):
+  [L1:2345] Element 'ICMSSN500': Missing child element(s). Expected is one of (vBCSTRet, ...).
+  [L1:2410] Element 'NFe': child element 'infNFeSupl' is invalid here.
+```
+
+Você pode abrir a venda rejeitada no app e ver o XML enviado + o diagnóstico — copiar e validar em ferramentas externas se quiser uma segunda opinião.
+
+## Endpoint de depuração
+
+Útil para validar um XML colado, sem precisar do PFX:
+
+```bash
+curl -X POST https://SEU-RELAY.onrender.com/validar \
+  -H "Content-Type: application/json" \
+  -d '{"xml": "<NFe>...</NFe>", "etapa": "nfe"}'
+```
+
+Resposta:
+```json
+{ "ok": false, "etapa": "nfe", "erros": [...] }
+```
