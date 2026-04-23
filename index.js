@@ -314,17 +314,41 @@ function postSefaz(url, soapXml, pfxBuffer, senha) {
 
 // ============================================================
 // 10. Parse retorno
+// ----------------------------------------------------------------
+// IMPORTANTE: o retorno da SEFAZ tem DOIS níveis de cStat:
+//   - <retEnviNFe><cStat> ........ status do LOTE (ex.: 103, 104)
+//   - <retEnviNFe><protNFe><infProt><cStat> ... status REAL da NOTA
+// Precisamos retornar o status da NOTA quando ele existir; senão,
+// caímos no status do lote (rejeições de schema, lote rejeitado, etc.).
 // ============================================================
 function parseRetorno(soapBody) {
-  const get = (tag) => {
-    const m = soapBody.match(new RegExp(`<${tag}[^>]*>([^<]+)</${tag}>`));
+  const getIn = (scope, tag) => {
+    const m = scope.match(new RegExp(`<${tag}[^>]*>([^<]+)</${tag}>`));
     return m ? m[1] : null;
   };
+
+  // Tenta extrair do <infProt> primeiro (status real da nota)
+  const infProtMatch = soapBody.match(/<infProt[^>]*>([\s\S]*?)<\/infProt>/);
+  if (infProtMatch) {
+    const inner = infProtMatch[1];
+    return {
+      cStat: getIn(inner, "cStat"),
+      xMotivo: getIn(inner, "xMotivo"),
+      nProt: getIn(inner, "nProt"),
+      chNFe: getIn(inner, "chNFe"),
+      cStatLote: getIn(soapBody, "cStat"),
+      xMotivoLote: getIn(soapBody, "xMotivo"),
+    };
+  }
+
+  // Fallback: status do lote (sem protNFe = lote rejeitado por schema, etc.)
   return {
-    cStat: get("cStat"),
-    xMotivo: get("xMotivo"),
-    nProt: get("nProt"),
-    chNFe: get("chNFe"),
+    cStat: getIn(soapBody, "cStat"),
+    xMotivo: getIn(soapBody, "xMotivo"),
+    nProt: getIn(soapBody, "nProt"),
+    chNFe: getIn(soapBody, "chNFe"),
+    cStatLote: getIn(soapBody, "cStat"),
+    xMotivoLote: getIn(soapBody, "xMotivo"),
   };
 }
 
@@ -372,7 +396,10 @@ app.post("/transmitir", async (req, res) => {
 
     // 5. Parse retorno
     const retorno = parseRetorno(body);
-    console.log(`[${chave}] cStat=${retorno.cStat} xMotivo=${retorno.xMotivo}`);
+    if (retorno.cStatLote && retorno.cStatLote !== retorno.cStat) {
+      console.log(`[${chave}] LOTE cStat=${retorno.cStatLote} xMotivo=${retorno.xMotivoLote}`);
+    }
+    console.log(`[${chave}] NOTA cStat=${retorno.cStat} xMotivo=${retorno.xMotivo}`);
 
     // 6. Adiciona infNFeSupl no XML retornado (para banco/impressão)
     let xmlFinal = xmlAssinado;
