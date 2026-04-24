@@ -1,99 +1,74 @@
-# Relay SEFAZ-SP NFC-e v5 — com Validação XSD Oficial
+# SEFAZ-SP NFC-e Relay v5.2
 
-## O que mudou em relação à v4
+## O que mudou em relação à v5.1
 
-A grande mudança: **o relay agora valida o XML contra o XSD oficial da SEFAZ ANTES de transmitir**. Isso elimina o ciclo de "mandar e receber cStat 225 sem saber o motivo".
+A v5.0/v5.1 dependia do pacote **`libxmljs2`** para validar o XML contra o XSD oficial. Esse pacote precisa **compilar código nativo C++** (via `node-gyp`) na hora do `npm install`. No Render, o build está usando **Node 25**, que é incompatível com `libxmljs2` (e a fixação via `engines`/`.nvmrc` foi ignorada pelo provedor).
 
-Quando o XML é inválido, o relay retorna **HTTP 422** com o elemento exato, linha e coluna do erro — em vez do genérico `cStat=225 Falha no Schema XML do lote de NFe` que a SEFAZ devolve.
+A v5.2 **resolve isso definitivamente** removendo o pacote nativo e usando o binário **`xmllint`** (parte do `libxml2`), que já vem instalado em todos os containers Linux do Render. Resultado:
 
-## Setup no Render (ou em qualquer Node 18+)
+- ✅ ZERO dependência nativa npm
+- ✅ ZERO `node-gyp`
+- ✅ Funciona em qualquer versão do Node (18, 20, 22, 25...)
+- ✅ Mesma validação XSD oficial PL_009_V4
+- ✅ Mesma resposta HTTP 422 + diagnóstico (linha, elemento, mensagem)
 
-### 1. Substitua os PEMs de CA Raiz no `index.js`
+## Setup no Render
 
-Procure por `COLE_AQUI_O_PEM_DA_AC_RAIZ_V2/V5/V10` e cole os PEMs reais que você já vinha usando na v4.
+### 1. Substitua os arquivos
 
-### 2. Baixe os schemas XSD oficiais
+Faça upload de:
+- `index.js`
+- `package.json`
 
-Crie a pasta `schemes/PL_009_V4/` e coloque dentro dela os arquivos abaixo (todos do repositório oficial `nfephp-org/sped-nfe`):
+### 2. Cole seus PEMs
 
+Em `index.js`, blocos `AC_RAIZ_V2`, `AC_RAIZ_V5`, `AC_RAIZ_V10` — substitua os placeholders pelos certificados reais que você já tinha na v4/v5.
+
+### 3. Crie a pasta `schemes/PL_009_V4/`
+
+Baixe os XSDs oficiais do repositório:
+https://github.com/nfephp-org/sped-nfe/tree/master/schemes/PL_009_V4
+
+Coloque todos os arquivos `.xsd` desse diretório na pasta `schemes/PL_009_V4/` do relay. Os essenciais:
 - `nfe_v4.00.xsd`
+- `enviNFe_v4.00.xsd`
 - `leiauteNFe_v4.00.xsd`
 - `tiposBasico_v4.00.xsd`
 - `xmldsig-core-schema_v1.01.xsd`
-- `enviNFe_v4.00.xsd`
 
-Comando rápido (Render terminal ou local):
+### 4. Faça push e redeploy
 
-```bash
-mkdir -p schemes/PL_009_V4
-cd schemes/PL_009_V4
-BASE="https://raw.githubusercontent.com/nfephp-org/sped-nfe/master/schemes/PL_009_V4"
-for f in nfe_v4.00.xsd leiauteNFe_v4.00.xsd tiposBasico_v4.00.xsd xmldsig-core-schema_v1.01.xsd enviNFe_v4.00.xsd; do
-  curl -sLO "$BASE/$f"
-done
+O Render vai rodar `npm install` (sem `libxmljs2` agora) e iniciar normalmente. O `xmllint` já está disponível no PATH.
+
+### 5. Verifique no log de boot
+
+Você deve ver:
+```
+[XSD] xmllint disponível: true
+[XSD] nfe_v4.00.xsd: true | enviNFe_v4.00.xsd: true
+Relay SEFAZ-SP v5.2 (XSD via xmllint) rodando na porta XXXX
 ```
 
-### 3. Instalar dependências
+Se aparecer `xmllint disponível: false`, instale via Render shell: `apt-get install -y libxml2-utils` (mas isso é raro, vem instalado).
 
-```bash
-npm install
-```
+## Endpoints
 
-A nova dependência é `libxmljs2`, que faz a validação XSD usando libxml2 nativo (mesmo motor que validadores oficiais usam).
+- `GET /health` → status + flags de schemas
+- `POST /transmitir` → fluxo completo (assina → valida XSD → transmite SEFAZ)
+- `POST /validar` → valida um XML offline contra um schema (`{ xml, etapa: "nfe"|"envi" }`)
 
-### 4. Subir
+## Comportamento da rejeição XSD
 
-```bash
-npm start
-```
-
-Ou, no Render, basta dar push — o `Procfile`/start padrão já roda `node index.js`.
-
-## Verificando que está tudo certo
-
-```bash
-curl https://SEU-RELAY.onrender.com/health
-```
-
-Deve responder algo como:
-
+Quando o XML falha no schema local, o relay responde **HTTP 422**:
 ```json
 {
-  "ok": true,
-  "ts": "2026-04-23T22:00:00.000Z",
-  "schemas": { "nfe": true, "enviNFe": true }
+  "erro": "schema_local",
+  "etapa": "nfe_v4.00",
+  "xsd_erros": [
+    { "linha": 47, "elemento": "ICMSSN500", "mensagem": "Element 'ICMSSN500': ..." }
+  ],
+  "xml_validado": "<NFe ...>"
 }
 ```
 
-Se aparecer `nfe: false`, é porque os XSDs não foram encontrados — confira a pasta `schemes/PL_009_V4/`.
-
-## Como o erro vai aparecer no app a partir de agora
-
-Antes:
-```
-NFC-e rejeitada: Falha no Schema XML do lote de NFe
-```
-
-Agora:
-```
-Schema XSD local (etapa nfe_v4.00):
-  [L1:2345] Element 'ICMSSN500': Missing child element(s). Expected is one of (vBCSTRet, ...).
-  [L1:2410] Element 'NFe': child element 'infNFeSupl' is invalid here.
-```
-
-Você pode abrir a venda rejeitada no app e ver o XML enviado + o diagnóstico — copiar e validar em ferramentas externas se quiser uma segunda opinião.
-
-## Endpoint de depuração
-
-Útil para validar um XML colado, sem precisar do PFX:
-
-```bash
-curl -X POST https://SEU-RELAY.onrender.com/validar \
-  -H "Content-Type: application/json" \
-  -d '{"xml": "<NFe>...</NFe>", "etapa": "nfe"}'
-```
-
-Resposta:
-```json
-{ "ok": false, "etapa": "nfe", "erros": [...] }
-```
+O frontend (Vendas.tsx) já está preparado para ler esse formato e exibir o diagnóstico.

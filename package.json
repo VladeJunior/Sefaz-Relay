@@ -1,20 +1,19 @@
 {
-  "name": "sefaz-nfce-relay",
-  "version": "5.0.0",
-  "description": "Relay SEFAZ-SP NFC-e com assinatura XML, mTLS e validação XSD oficial",
+  "name": "sefaz-relay",
+  "version": "5.2.0",
+  "description": "Relay SEFAZ-SP NFC-e com validação XSD via xmllint (sem dependência nativa)",
   "main": "index.js",
   "scripts": {
     "start": "node index.js",
-    "validate-xsd": "node scripts/validate-xsd.js"
-  },
-  "dependencies": {
-    "express": "^4.19.2",
-    "node-forge": "^1.3.1",
-    "xml-crypto": "^6.0.0",
-    "@xmldom/xmldom": "^0.8.10",
-    "libxmljs2": "^0.35.0"
+    "validate-xsd": "node -e \"const {execFileSync}=require('child_process');const f=process.argv[1];const s=process.argv[2]||'./schemes/PL_009_V4/nfe_v4.00.xsd';try{execFileSync('xmllint',['--noout','--schema',s,f],{stdio:'inherit'});console.log('OK');}catch(e){process.exit(1);}\""
   },
   "engines": {
     "node": ">=18"
+  },
+  "dependencies": {
+    "@xmldom/xmldom": "^0.8.10",
+    "express": "^4.19.2",
+    "node-forge": "^1.3.1",
+    "xml-crypto": "^6.0.0"
   }
 }

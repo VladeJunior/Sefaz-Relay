@@ -1,11 +1,11 @@
-// SEFAZ-SP NFC-e Relay v5 — Validação XSD oficial antes de transmitir
+// SEFAZ-SP NFC-e Relay v5.2 — Validação XSD via xmllint (sem dependência nativa)
 // ---------------------------------------------------------------
-// Mudança chave em relação à v4:
-//   - Validação XSD oficial (PL_009_V4) ANTES de enviar para a SEFAZ.
-//   - Quando o XML não passa no schema, devolve HTTP 422 com diagnóstico
-//     contendo o ELEMENTO EXATO que quebrou (linha, coluna, mensagem).
-//   - Com isso a aplicação para de receber "cStat 225" genérico e passa
-//     a saber exatamente qual nó/atributo está inválido.
+// Mudança chave em relação à v5/v5.1:
+//   - REMOVIDO libxmljs2 (que falha de compilar no Node 25 do Render).
+//   - Validação XSD oficial agora usa o binário `xmllint` (libxml2)
+//     já presente em todo container Linux do Render — ZERO dependência
+//     nativa npm, ZERO node-gyp, ZERO problema de versão de Node.
+//   - Comportamento idêntico ao v5: HTTP 422 + diagnóstico XSD detalhado.
 // ---------------------------------------------------------------
 
 const express = require("express");
@@ -17,7 +17,8 @@ const crypto = require("crypto");
 const forge = require("node-forge");
 const { DOMParser, XMLSerializer } = require("@xmldom/xmldom");
 const { SignedXml } = require("xml-crypto");
-const libxml = require("libxmljs2");
+const { execFileSync, spawnSync } = require("child_process");
+const os = require("os");
 
 // ============================================================
 // 1. ICP-Brasil CA Bundle (substitua pelos PEMs reais)
@@ -53,86 +54,95 @@ const QR_BASE = {
 };
 
 // ============================================================
-// 3. CARREGAMENTO DOS SCHEMAS XSD OFICIAIS (PL_009_V4)
+// 3. VALIDAÇÃO XSD via xmllint (libxml2 do sistema)
 // ------------------------------------------------------------
-// Os arquivos devem estar em ./schemes/PL_009_V4/
+// Em vez de depender do libxmljs2 (que precisa compilar nativamente
+// e quebra no Node 25 do Render), usamos o binário `xmllint` que
+// já vem instalado em todos os containers Linux do Render.
+//
+// Os XSDs devem estar em ./schemes/PL_009_V4/
 // Baixe em: https://github.com/nfephp-org/sped-nfe/tree/master/schemes/PL_009_V4
 // Arquivos necessários:
-//   - leiauteNFe_v4.00.xsd       (define <NFe>)
+//   - leiauteNFe_v4.00.xsd
 //   - tiposBasico_v4.00.xsd
 //   - xmldsig-core-schema_v1.01.xsd
-//   - enviNFe_v4.00.xsd          (define <enviNFe>)
+//   - enviNFe_v4.00.xsd
 //   - nfe_v4.00.xsd
 // ============================================================
 const SCHEMAS_DIR = path.join(__dirname, "schemes", "PL_009_V4");
+const SCHEMA_NFE_PATH = path.join(SCHEMAS_DIR, "nfe_v4.00.xsd");
+const SCHEMA_ENVI_PATH = path.join(SCHEMAS_DIR, "enviNFe_v4.00.xsd");
 
-let SCHEMA_NFE = null;
-let SCHEMA_ENVI = null;
-
-function loadSchema(filename) {
-  const fullPath = path.join(SCHEMAS_DIR, filename);
-  if (!fs.existsSync(fullPath)) {
-    console.warn(`[SCHEMA] Arquivo não encontrado: ${fullPath} — validação XSD desabilitada para este schema.`);
-    return null;
-  }
-  try {
-    // libxmljs2 resolve includes relativos automaticamente quando passamos baseUrl
-    const xsdContent = fs.readFileSync(fullPath, "utf8");
-    return libxml.parseXml(xsdContent, { baseUrl: SCHEMAS_DIR + path.sep });
-  } catch (err) {
-    console.error(`[SCHEMA] Erro carregando ${filename}:`, err.message);
-    return null;
-  }
+let XMLLINT_AVAILABLE = false;
+try {
+  const r = spawnSync("xmllint", ["--version"], { encoding: "utf8" });
+  XMLLINT_AVAILABLE = r.status === 0 || (r.stderr || "").includes("xmllint");
+  console.log(`[XSD] xmllint disponível: ${XMLLINT_AVAILABLE}`);
+} catch (e) {
+  console.warn(`[XSD] xmllint NÃO disponível: ${e.message}`);
 }
 
-function loadAllSchemas() {
-  if (!fs.existsSync(SCHEMAS_DIR)) {
-    console.warn(`[SCHEMA] Diretório ${SCHEMAS_DIR} não existe. Validação XSD DESABILITADA. Crie o diretório e baixe os XSDs.`);
-    return;
-  }
-  SCHEMA_NFE = loadSchema("nfe_v4.00.xsd");
-  SCHEMA_ENVI = loadSchema("enviNFe_v4.00.xsd");
-  console.log(`[SCHEMA] NFe carregado: ${!!SCHEMA_NFE} | enviNFe carregado: ${!!SCHEMA_ENVI}`);
+const SCHEMA_NFE_OK = fs.existsSync(SCHEMA_NFE_PATH);
+const SCHEMA_ENVI_OK = fs.existsSync(SCHEMA_ENVI_PATH);
+console.log(`[XSD] nfe_v4.00.xsd: ${SCHEMA_NFE_OK} | enviNFe_v4.00.xsd: ${SCHEMA_ENVI_OK}`);
+if (!SCHEMA_NFE_OK || !SCHEMA_ENVI_OK) {
+  console.warn(`[XSD] XSDs ausentes em ${SCHEMAS_DIR} — validação será PULADA. Crie a pasta e baixe os schemas oficiais PL_009_V4.`);
 }
 
-loadAllSchemas();
-
-// ============================================================
-// 4. Validação XSD genérica
-// ------------------------------------------------------------
-// Retorna:
-//   - { ok: true } se passar (ou se schema não estiver carregado)
-//   - { ok: false, etapa, erros: [{ linha, coluna, mensagem, elemento }] }
-// ============================================================
-function validateXsd(xmlString, schema, etapa) {
-  if (!schema) {
-    return { ok: true, skipped: true, motivo: `Schema ${etapa} não carregado` };
+// Parser de saída do xmllint:
+// Formato: "<arquivo>:<linha>: element X: Schemas validity error : Element '...': mensagem"
+function parseXmllintErrors(stderr) {
+  const linhas = (stderr || "").split("\n").map(l => l.trim()).filter(Boolean);
+  const erros = [];
+  for (const linha of linhas) {
+    if (linha.includes("validates") || linha.includes("fails to validate")) continue;
+    // tenta extrair número de linha
+    const matchLinha = linha.match(/^[^:]+:(\d+):/);
+    const ln = matchLinha ? parseInt(matchLinha[1], 10) : null;
+    // tenta extrair elemento
+    const matchEl = linha.match(/Element\s+'([^']+)'/i);
+    const elemento = matchEl ? matchEl[1] : null;
+    erros.push({
+      linha: ln,
+      coluna: null,
+      mensagem: linha,
+      elemento,
+    });
   }
-  try {
-    const doc = libxml.parseXml(xmlString);
-    const valid = doc.validate(schema);
-    if (valid) return { ok: true };
+  return erros;
+}
 
-    const erros = (doc.validationErrors || []).map((e) => ({
-      linha: e.line,
-      coluna: e.column,
-      nivel: e.level,
-      codigo: e.code,
-      dominio: e.domain,
-      mensagem: (e.message || "").trim(),
-      // Tenta extrair o elemento entre aspas da mensagem ("Element 'X': ...")
-      elemento: (() => {
-        const m = (e.message || "").match(/Element\s+'([^']+)'/i);
-        return m ? m[1] : null;
-      })(),
-    }));
-    return { ok: false, etapa, erros };
+function validateXsd(xmlString, schemaPath, etapa) {
+  if (!XMLLINT_AVAILABLE) {
+    return { ok: true, skipped: true, motivo: "xmllint não disponível no sistema" };
+  }
+  if (!fs.existsSync(schemaPath)) {
+    return { ok: true, skipped: true, motivo: `Schema ${etapa} não encontrado em ${schemaPath}` };
+  }
+  // grava XML em arquivo temporário
+  const tmpXml = path.join(os.tmpdir(), `validate-${Date.now()}-${Math.random().toString(36).slice(2)}.xml`);
+  try {
+    fs.writeFileSync(tmpXml, xmlString, "utf8");
+    const r = spawnSync(
+      "xmllint",
+      ["--noout", "--schema", schemaPath, tmpXml],
+      { encoding: "utf8", maxBuffer: 20 * 1024 * 1024 }
+    );
+    if (r.status === 0) return { ok: true };
+    const erros = parseXmllintErrors(r.stderr || r.stdout || "");
+    return {
+      ok: false,
+      etapa,
+      erros: erros.length ? erros : [{ linha: null, coluna: null, mensagem: (r.stderr || "Validação falhou sem mensagem").slice(0, 2000) }],
+    };
   } catch (err) {
     return {
       ok: false,
       etapa,
-      erros: [{ linha: null, coluna: null, mensagem: `Falha ao parsear XML: ${err.message}` }],
+      erros: [{ linha: null, coluna: null, mensagem: `Erro executando xmllint: ${err.message}` }],
     };
+  } finally {
+    try { fs.unlinkSync(tmpXml); } catch (_) {}
   }
 }
 
@@ -336,7 +346,7 @@ app.get("/health", (_req, res) => {
   res.json({
     ok: true,
     ts: new Date().toISOString(),
-    schemas: { nfe: !!SCHEMA_NFE, enviNFe: !!SCHEMA_ENVI },
+    schemas: { nfe: SCHEMA_NFE_OK, enviNFe: SCHEMA_ENVI_OK, xmllint: XMLLINT_AVAILABLE },
   });
 });
 
@@ -370,7 +380,7 @@ app.post("/transmitir", async (req, res) => {
     }
 
     // 4. NOVO — Validação XSD do XML da NFe
-    const validNFe = validateXsd(xmlFinal, SCHEMA_NFE, "nfe_v4.00");
+    const validNFe = validateXsd(xmlFinal, SCHEMA_NFE_PATH, "nfe_v4.00");
     if (!validNFe.ok) {
       console.log(`[${chave}] XSD NFe FALHOU: ${validNFe.erros.length} erro(s)`);
       validNFe.erros.slice(0, 5).forEach((e) =>
@@ -389,7 +399,7 @@ app.post("/transmitir", async (req, res) => {
     const enviNFe = buildEnviNFe(xmlFinal);
 
     // 6. NOVO — Validação XSD do envelope <enviNFe>
-    const validEnvi = validateXsd(enviNFe, SCHEMA_ENVI, "enviNFe_v4.00");
+    const validEnvi = validateXsd(enviNFe, SCHEMA_ENVI_PATH, "enviNFe_v4.00");
     if (!validEnvi.ok) {
       console.log(`[${chave}] XSD enviNFe FALHOU: ${validEnvi.erros.length} erro(s)`);
       validEnvi.erros.slice(0, 5).forEach((e) =>
@@ -444,10 +454,10 @@ app.post("/transmitir", async (req, res) => {
 app.post("/validar", (req, res) => {
   const { xml, etapa } = req.body;
   if (!xml) return res.status(400).json({ error: "Campo 'xml' obrigatório" });
-  const schema = etapa === "envi" ? SCHEMA_ENVI : SCHEMA_NFE;
-  const result = validateXsd(xml, schema, etapa || "nfe");
+  const schemaPath = etapa === "envi" ? SCHEMA_ENVI_PATH : SCHEMA_NFE_PATH;
+  const result = validateXsd(xml, schemaPath, etapa || "nfe");
   return res.json(result);
 });
 
 const PORT = process.env.PORT || 10000;
-app.listen(PORT, () => console.log(`Relay SEFAZ-SP v5 (com validação XSD) rodando na porta ${PORT}`));
+app.listen(PORT, () => console.log(`Relay SEFAZ-SP v5.2 (XSD via xmllint) rodando na porta ${PORT}`));
