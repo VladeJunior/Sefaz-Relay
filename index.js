@@ -1,6 +1,14 @@
-// SEFAZ-SP NFC-e Relay v5.2 — Validação XSD via xmllint (sem dependência nativa)
+// SEFAZ-SP NFC-e Relay v5.3 — Remove xmlns redundante do <NFe> dentro do envelope
 // ---------------------------------------------------------------
-// Mudança chave em relação à v5/v5.1:
+// Mudança chave em relação à v5.2:
+//   - CORREÇÃO cStat=225: o <NFe> assinado tem xmlns="...nfe" próprio (necessário
+//     para a assinatura ser válida isolada). Mas dentro de <enviNFe xmlns="...nfe">
+//     o xmlns repetido no <NFe> dispara cStat=225 na SEFAZ-SP (mesmo passando no XSD
+//     local, porque o parser deles não aceita namespace redundante em filho).
+//   - SOLUÇÃO: ao montar o envelope, remover SOMENTE o xmlns do elemento raiz <NFe>
+//     (sem alterar nada do conteúdo interno nem da assinatura).
+//
+// Mudança herdada da v5.2:
 //   - REMOVIDO libxmljs2 (que falha de compilar no Node 25 do Render).
 //   - Validação XSD oficial agora usa o binário `xmllint` (libxml2)
 //     já presente em todo container Linux do Render — ZERO dependência
@@ -351,11 +359,27 @@ function addInfNFeSupl(xmlAssinado, qrCode, urlChave) {
 // 9. Envelope <enviNFe>
 // ============================================================
 function buildEnviNFe(xmlNFeFinal) {
+  // Remove o prólogo <?xml ... ?>
+  let nfe = xmlNFeFinal.replace(/<\?xml[^>]*\?>/, "");
+
+  // CORREÇÃO cStat=225: o <NFe> assinado vem com xmlns próprio porque
+  // a assinatura precisa dele isolado (regra de canonicalização exclusiva).
+  // Mas quando aninhado em <enviNFe xmlns="...nfe">, o xmlns repetido na
+  // raiz <NFe> faz a SEFAZ-SP rejeitar com 225. O conteúdo interno
+  // (infNFe, infNFeSupl, Signature) permanece INTACTO — só o atributo
+  // xmlns do elemento raiz <NFe> é removido. Isso NÃO invalida a
+  // assinatura, porque ela referencia <infNFe> via local-name() e foi
+  // computada sobre o XML original assinado.
+  nfe = nfe.replace(
+    /^<NFe\s+xmlns="http:\/\/www\.portalfiscal\.inf\.br\/nfe"\s*>/,
+    "<NFe>"
+  );
+
   return `<?xml version="1.0" encoding="UTF-8"?>` +
     `<enviNFe xmlns="http://www.portalfiscal.inf.br/nfe" versao="4.00">` +
     `<idLote>1</idLote>` +
     `<indSinc>1</indSinc>` +
-    xmlNFeFinal.replace(/<\?xml[^>]*\?>/, "") +
+    nfe +
     `</enviNFe>`;
 }
 

@@ -1,74 +1,61 @@
-# SEFAZ-SP NFC-e Relay v5.2
+# SEFAZ-SP NFC-e Relay v5.3
 
-## O que mudou em relação à v5.1
+## O que mudou (v5.2 → v5.3)
 
-A v5.0/v5.1 dependia do pacote **`libxmljs2`** para validar o XML contra o XSD oficial. Esse pacote precisa **compilar código nativo C++** (via `node-gyp`) na hora do `npm install`. No Render, o build está usando **Node 25**, que é incompatível com `libxmljs2` (e a fixação via `engines`/`.nvmrc` foi ignorada pelo provedor).
+### Diagnóstico baseado em log real do banco
 
-A v5.2 **resolve isso definitivamente** removendo o pacote nativo e usando o binário **`xmllint`** (parte do `libxml2`), que já vem instalado em todos os containers Linux do Render. Resultado:
+Capturamos o XML exato que o relay v5.2 estava enviando. O envelope tem esta estrutura:
 
-- ✅ ZERO dependência nativa npm
-- ✅ ZERO `node-gyp`
-- ✅ Funciona em qualquer versão do Node (18, 20, 22, 25...)
-- ✅ Mesma validação XSD oficial PL_009_V4
-- ✅ Mesma resposta HTTP 422 + diagnóstico (linha, elemento, mensagem)
-
-## Setup no Render
-
-### 1. Substitua os arquivos
-
-Faça upload de:
-- `index.js`
-- `package.json`
-
-### 2. Cole seus PEMs
-
-Em `index.js`, blocos `AC_RAIZ_V2`, `AC_RAIZ_V5`, `AC_RAIZ_V10` — substitua os placeholders pelos certificados reais que você já tinha na v4/v5.
-
-### 3. Crie a pasta `schemes/PL_009_V4/`
-
-Baixe os XSDs oficiais do repositório:
-https://github.com/nfephp-org/sped-nfe/tree/master/schemes/PL_009_V4
-
-Coloque todos os arquivos `.xsd` desse diretório na pasta `schemes/PL_009_V4/` do relay. Os essenciais:
-- `nfe_v4.00.xsd`
-- `enviNFe_v4.00.xsd`
-- `leiauteNFe_v4.00.xsd`
-- `tiposBasico_v4.00.xsd`
-- `xmldsig-core-schema_v1.01.xsd`
-
-### 4. Faça push e redeploy
-
-O Render vai rodar `npm install` (sem `libxmljs2` agora) e iniciar normalmente. O `xmllint` já está disponível no PATH.
-
-### 5. Verifique no log de boot
-
-Você deve ver:
-```
-[XSD] xmllint disponível: true
-[XSD] nfe_v4.00.xsd: true | enviNFe_v4.00.xsd: true
-Relay SEFAZ-SP v5.2 (XSD via xmllint) rodando na porta XXXX
+```xml
+<enviNFe xmlns="http://www.portalfiscal.inf.br/nfe" versao="4.00">
+  <idLote>1</idLote>
+  <indSinc>1</indSinc>
+  <NFe xmlns="http://www.portalfiscal.inf.br/nfe">   ← xmlns REDUNDANTE
+    <infNFe ...>
+    ...
 ```
 
-Se aparecer `xmllint disponível: false`, instale via Render shell: `apt-get install -y libxml2-utils` (mas isso é raro, vem instalado).
+O `xmllint` (validador local) **aceita** namespace redundante porque é tecnicamente válido em XML. **A SEFAZ-SP NÃO aceita** — o parser dela retorna `cStat=225 — Falha no Schema XML do lote de NFe` mesmo o XSD oficial passando.
 
-## Endpoints
+### Por que o `<NFe>` vem com `xmlns` próprio?
 
-- `GET /health` → status + flags de schemas
-- `POST /transmitir` → fluxo completo (assina → valida XSD → transmite SEFAZ)
-- `POST /validar` → valida um XML offline contra um schema (`{ xml, etapa: "nfe"|"envi" }`)
+A assinatura digital (`xml-crypto`) usa canonicalização exclusiva (`xml-c14n-20010315`). Para a assinatura ser válida quando a NFe é destacada do envelope para validação isolada, o `<NFe>` **precisa** ter seu próprio `xmlns` no momento da assinatura. Se removermos antes de assinar, a assinatura quebra.
 
-## Comportamento da rejeição XSD
+### Correção
 
-Quando o XML falha no schema local, o relay responde **HTTP 422**:
-```json
-{
-  "erro": "schema_local",
-  "etapa": "nfe_v4.00",
-  "xsd_erros": [
-    { "linha": 47, "elemento": "ICMSSN500", "mensagem": "Element 'ICMSSN500': ..." }
-  ],
-  "xml_validado": "<NFe ...>"
-}
+Em `buildEnviNFe()`:
+1. Remove o prólogo `<?xml ... ?>`.
+2. Remove **somente** o atributo `xmlns="http://www.portalfiscal.inf.br/nfe"` da tag raiz `<NFe>` (regex ancorada em `^<NFe ...>`).
+3. Conteúdo interno (`infNFe`, `infNFeSupl`, `Signature`) fica **intacto**.
+4. A assinatura continua válida porque foi computada sobre o XML original e referencia `<infNFe>` via `local-name()`.
+
+Resultado: `<enviNFe ...><idLote>1</idLote><indSinc>1</indSinc><NFe><infNFe...>...</NFe></enviNFe>` — sem namespace duplicado.
+
+---
+
+## Deploy no Render
+
+1. Substitua `index.js` no repositório.
+2. **Não precisa** mudar `package.json` (mesmo da v5.2).
+3. Restaure os PEMs reais (AC_RAIZ_V2, V5, V10) no topo do arquivo.
+4. Garanta que `schemes/PL_009_V4/` existe com os XSDs.
+5. Push → Render redeploy automático.
+
+## Como confirmar que funcionou
+
+Após o deploy, emita uma NFC-e e verifique:
+
+- **Cenário sucesso**: cStat=100 ("Autorizado o uso da NF-e") + protocolo retornado.
+- **Cenário ainda falha 225**: significa que há outro problema. Olhe o log do relay no Render — agora o XML transmitido NÃO terá mais o `xmlns` duplicado, e a investigação parte de outro ponto (provavelmente CSC mal configurado, encoding, ou conteúdo de algum campo).
+
+## Verificação rápida do XML após a correção
+
+Procure no log do relay (Render dashboard) ou no `logs_sefaz.request` por:
+
+```
+<enviNFe xmlns="http://www.portalfiscal.inf.br/nfe" versao="4.00"><idLote>1</idLote><indSinc>1</indSinc><NFe><infNFe...
 ```
 
-O frontend (Vendas.tsx) já está preparado para ler esse formato e exibir o diagnóstico.
+Se aparecer `<NFe>` sem atributos = correção aplicada com sucesso.
+Se ainda aparecer `<NFe xmlns="...">` = a regex não casou (caso muito raro de espaços extras); abrir issue.
+
